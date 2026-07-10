@@ -325,18 +325,28 @@ def _ensure_gps_serial():
         except Exception:
             pass
 
-    serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-    serial_conn.reset_input_buffer()
-    st.session_state.gps_serial = serial_conn
+    try:
+        serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        serial_conn.reset_input_buffer()
+        st.session_state.gps_serial = serial_conn
+    except Exception:
+        st.session_state.gps_serial = None
 
 def poll_gps(block_until_fix=False, timeout_s=5.0):
     """Read buffered serial data and return the latest valid GGA fix."""
     _ensure_gps_serial()
-    ser = st.session_state.gps_serial
+    ser = st.session_state.get("gps_serial")
+    if ser is None:
+        return st.session_state.get("last_gps_msg")
+
     deadline = time.time() + (timeout_s if block_until_fix else 0)
 
     while True:
-        line = ser.readline().decode("ascii", errors="replace").strip()
+        try:
+            line = ser.readline().decode("ascii", errors="replace").strip()
+        except Exception:
+            break
+
         if line:
             for sentence in _iter_nmea_sentences(line):
                 msg = _parse_gga_sentence(sentence)
@@ -350,7 +360,10 @@ def poll_gps(block_until_fix=False, timeout_s=5.0):
                 break
             continue
 
-        if not line or ser.in_waiting == 0:
+        try:
+            if not line or ser.in_waiting == 0:
+                break
+        except Exception:
             break
 
     return st.session_state.last_gps_msg

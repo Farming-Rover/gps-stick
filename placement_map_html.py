@@ -219,11 +219,13 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
 
       function pushViewportToStreamlit() {
         const center = map.getCenter();
-        const url = new URL(window.top.location.href);
-        url.searchParams.set("origin_lat", center.lat.toFixed(8));
-        url.searchParams.set("origin_lon", center.lng.toFixed(8));
-        url.searchParams.set("map_zoom", String(map.getZoom()));
-        window.top.location.href = url.toString();
+        const baseUrl = window.location.origin + window.location.pathname;
+        const nextUrl = "/?origin_lat=" + center.lat.toFixed(8) + "&origin_lon=" + center.lng.toFixed(8) + "&map_zoom=" + String(map.getZoom());
+        try {
+          window.top.location.href = nextUrl;
+        } catch (e) {
+          window.parent.location.href = nextUrl;
+        }
       }
 
       function onViewportChanged() {
