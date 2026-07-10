@@ -120,9 +120,6 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
       <div class="center-reticle" title="Grid origin (R1C1)"></div>
       <div class="map-hud">
         <div id="origin-readout" class="origin-readout"></div>
-        <button id="apply-origin" class="apply-origin-btn" type="button">
-          Apply grid origin
-        </button>
       </div>
     </div>
 
