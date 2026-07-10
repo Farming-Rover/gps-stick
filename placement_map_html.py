@@ -246,33 +246,9 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
       }
 
       function applyUpdateGrid(data) {
-        let changed = false;
-
-        if (data.dim_m != null) {
-          const nextM = asCount(data.dim_m, MAP_CONFIG.dim_m || 4);
-          if (nextM !== MAP_CONFIG.dim_m) {
-            MAP_CONFIG.dim_m = nextM;
-            changed = true;
-          }
-        }
-        if (data.dim_e != null) {
-          const nextE = asCount(data.dim_e, MAP_CONFIG.dim_e || 4);
-          if (nextE !== MAP_CONFIG.dim_e) {
-            MAP_CONFIG.dim_e = nextE;
-            changed = true;
-          }
-        }
-        if (data.spacing_m != null) {
-          const nextSpacing = Number(data.spacing_m);
-          if (nextSpacing !== MAP_CONFIG.spacing_m) {
-            MAP_CONFIG.spacing_m = nextSpacing;
-            changed = true;
-          }
-        }
-
-        if (!changed) {
-          return;
-        }
+        if (data.dim_m != null) MAP_CONFIG.dim_m = asCount(data.dim_m, 4);
+        if (data.dim_e != null) MAP_CONFIG.dim_e = asCount(data.dim_e, 4);
+        if (data.spacing_m != null) MAP_CONFIG.spacing_m = Number(data.spacing_m);
 
         const center = map.getCenter();
         drawGrid(center.lat, center.lng);
