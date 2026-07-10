@@ -121,12 +121,104 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         width: 100%;
         height: 520px;
       }
+
+      .map-hud {
+        position: absolute;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        pointer-events: none;
+      }
+
+      .nav-readout {
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font: 14px/1.35 sans-serif;
+        color: #222;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+      }
+
+      .nav-readout.reached {
+        background: rgba(232, 245, 233, 0.96);
+        border-color: rgba(46, 125, 50, 0.35);
+        color: #1b5e20;
+        font-weight: 600;
+      }
+
+      .nav-readout.warn {
+        background: rgba(255, 243, 224, 0.96);
+        border-color: rgba(239, 108, 0, 0.35);
+      }
+
+      .perm-banner {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        right: 10px;
+        z-index: 1001;
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 8px;
+        padding: 10px 12px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        pointer-events: auto;
+      }
+
+      .perm-banner p {
+        margin: 0 0 8px;
+        font: 13px/1.4 sans-serif;
+        color: #333;
+      }
+
+      .perm-banner button {
+        border: none;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font: 13px/1.2 sans-serif;
+        font-weight: 600;
+        color: #fff;
+        background: #1565c0;
+        cursor: pointer;
+      }
+
+      .perm-banner button:hover {
+        background: #0d47a1;
+      }
+
+      .perm-banner.hidden {
+        display: none;
+      }
+
+      .desktop-warn {
+        background: rgba(255, 243, 224, 0.96);
+        border-color: rgba(239, 108, 0, 0.35);
+      }
+
+      .desktop-warn p {
+        color: #bf360c;
+      }
     </style>
   </head>
   <body>
     <div class="map-shell">
       <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
       <div id="map"></div>
+      <div id="perm-banner" class="perm-banner">
+        <p>Allow this device to use your location and compass so the map can show where you are facing.</p>
+        <button id="enable-sensors" type="button">Enable location &amp; compass</button>
+      </div>
+      <div id="desktop-warn" class="perm-banner desktop-warn hidden">
+        <p>Desktop browsers usually do not provide compass orientation. Use a phone or tablet to see which way you are facing and get forward/back/left/right directions.</p>
+      </div>
+      <div class="map-hud">
+        <div id="nav-readout" class="nav-readout">Waiting for device location...</div>
+      </div>
     </div>
 
     <script
@@ -139,6 +231,193 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       const MAP_CONFIG = JSON.parse(
         atob(document.getElementById("map-config").dataset.configB64)
       );
+
+      const NAV_MESSAGE_TYPE = "gps-stick-nav";
+      let clientSensorsActive = false;
+      let geoWatchId = null;
+      let desktopNoOrientation = false;
+
+      function isLikelyDesktop() {
+        const ua = navigator.userAgent || "";
+        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
+        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
+        return !mobile && !hasTouch;
+      }
+
+      function showDesktopOrientationWarning() {
+        desktopNoOrientation = true;
+        const banner = document.getElementById("desktop-warn");
+        if (banner) {
+          banner.classList.remove("hidden");
+        }
+        publishNavUpdate({
+          distance: null,
+          direction: null,
+          reached: false,
+          desktopNoOrientation: true,
+        });
+      }
+
+      function getDistanceAndBearing(lat1, lon1, lat2, lon2) {
+        const earthRadius = 6371000;
+        const phi1 = (lat1 * Math.PI) / 180;
+        const phi2 = (lat2 * Math.PI) / 180;
+        const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
+        const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
+        const a =
+          Math.sin(deltaPhi / 2) ** 2 +
+          Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) ** 2;
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        const distance = earthRadius * c;
+        const y = Math.sin(deltaLambda) * Math.cos(phi2);
+        const x =
+          Math.cos(phi1) * Math.sin(phi2) -
+          Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
+        const bearing = (Math.atan2(y, x) * 180) / Math.PI;
+        return { distance, bearing: (bearing + 360) % 360 };
+      }
+
+      function destinationLatLng(lat, lon, bearingDeg, distanceM) {
+        const earthRadius = 6371000;
+        const bearing = (bearingDeg * Math.PI) / 180;
+        const lat1 = (lat * Math.PI) / 180;
+        const lon1 = (lon * Math.PI) / 180;
+        const lat2 = Math.asin(
+          Math.sin(lat1) * Math.cos(distanceM / earthRadius) +
+            Math.cos(lat1) *
+              Math.sin(distanceM / earthRadius) *
+              Math.cos(bearing)
+        );
+        const lon2 =
+          lon1 +
+          Math.atan2(
+            Math.sin(bearing) *
+              Math.sin(distanceM / earthRadius) *
+              Math.cos(lat1),
+            Math.cos(distanceM / earthRadius) -
+              Math.sin(lat1) * Math.sin(lat2)
+          );
+        return [(lat2 * 180) / Math.PI, (lon2 * 180) / Math.PI];
+      }
+
+      function getRelativeDirection(userHeading, bearingToTarget) {
+        const relative = (bearingToTarget - userHeading + 360) % 360;
+        if (relative >= 315 || relative < 45) {
+          return "forward";
+        }
+        if (relative < 135) {
+          return "right";
+        }
+        if (relative < 225) {
+          return "back";
+        }
+        return "left";
+      }
+
+      function directionLabel(direction) {
+        return {
+          forward: "Head forward",
+          back: "Head back",
+          left: "Head left",
+          right: "Head right",
+        }[direction];
+      }
+
+      function publishNavUpdate(payload) {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
+            navChannel.postMessage(payload);
+            navChannel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function updateNavigationHud() {
+        const readout = document.getElementById("nav-readout");
+        if (!readout) {
+          return;
+        }
+
+        const targetLat = Number(MAP_CONFIG.target_lat);
+        const targetLon = Number(MAP_CONFIG.target_lon);
+        const userLat = Number(MAP_CONFIG.user_lat);
+        const userLon = Number(MAP_CONFIG.user_lon);
+
+        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
+          readout.textContent = "Select a target grid point.";
+          readout.className = "nav-readout";
+          return;
+        }
+
+        if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
+          readout.textContent = "Waiting for device location...";
+          readout.className = "nav-readout";
+          return;
+        }
+
+        const { distance, bearing } = getDistanceAndBearing(
+          userLat,
+          userLon,
+          targetLat,
+          targetLon
+        );
+
+        if (distance < 0.015) {
+          readout.textContent = "TARGET REACHED (within 1.5 cm)!";
+          readout.className = "nav-readout reached";
+          publishNavUpdate({
+            distance,
+            direction: "forward",
+            reached: true,
+            accuracy: MAP_CONFIG.user_accuracy,
+          });
+          return;
+        }
+
+        const accuracy = Number(MAP_CONFIG.user_accuracy);
+        let accuracyNote = "";
+        if (Number.isFinite(accuracy) && accuracy > 5) {
+          accuracyNote = " · GPS accuracy is low";
+          readout.className = "nav-readout warn";
+        } else {
+          readout.className = "nav-readout";
+        }
+
+        const heading = Number(MAP_CONFIG.user_heading);
+        if (!Number.isFinite(heading)) {
+          if (desktopNoOrientation) {
+            readout.textContent =
+              `${distance.toFixed(2)} m to target · compass not available on desktop` +
+              accuracyNote;
+          } else {
+            readout.textContent =
+              `${distance.toFixed(2)} m to target · enable compass for directions` +
+              accuracyNote;
+          }
+          publishNavUpdate({
+            distance,
+            direction: null,
+            reached: false,
+            accuracy,
+            desktopNoOrientation,
+          });
+          return;
+        }
+
+        const direction = getRelativeDirection(heading, bearing);
+        readout.textContent =
+          `${directionLabel(direction)} · ${distance.toFixed(2)} m to target` +
+          accuracyNote;
+        publishNavUpdate({
+          distance,
+          direction,
+          reached: false,
+          accuracy,
+        });
+      }
 
       function drawGridMarkers() {
         gridLayer.clearLayers();
@@ -156,8 +435,34 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         });
       }
 
+      function drawFacingCone() {
+        facingLayer.clearLayers();
+        const heading = Number(MAP_CONFIG.user_heading);
+        const lat = Number(MAP_CONFIG.user_lat);
+        const lon = Number(MAP_CONFIG.user_lon);
+        if (!Number.isFinite(heading) || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+          return;
+        }
+
+        const coneLength = 14;
+        const coneSpread = 32;
+        const center = [lat, lon];
+        const left = destinationLatLng(lat, lon, heading - coneSpread / 2, coneLength);
+        const tip = destinationLatLng(lat, lon, heading, coneLength);
+        const right = destinationLatLng(lat, lon, heading + coneSpread / 2, coneLength);
+
+        L.polygon([center, left, tip, right], {
+          color: "#FF4444",
+          fillColor: "#FF4444",
+          fillOpacity: 0.28,
+          weight: 1,
+          interactive: false,
+        }).addTo(facingLayer);
+      }
+
       function drawUserMarker() {
         userMarker.clearLayers();
+        drawFacingCone();
         L.circleMarker([MAP_CONFIG.user_lat, MAP_CONFIG.user_lon], {
           radius: 7,
           color: "#FF0000",
@@ -167,6 +472,102 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         })
           .bindPopup("Your position")
           .addTo(userMarker);
+        updateNavigationHud();
+      }
+
+      function getCompassHeading(event) {
+        if (event.webkitCompassHeading != null && Number.isFinite(event.webkitCompassHeading)) {
+          return event.webkitCompassHeading;
+        }
+        if (event.alpha != null && Number.isFinite(event.alpha)) {
+          return (360 - event.alpha) % 360;
+        }
+        return null;
+      }
+
+      function onDeviceOrientation(event) {
+        const heading = getCompassHeading(event);
+        if (heading == null) {
+          return;
+        }
+        MAP_CONFIG.user_heading = heading;
+        drawUserMarker();
+      }
+
+      async function requestOrientationPermission() {
+        if (
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+        ) {
+          const response = await DeviceOrientationEvent.requestPermission();
+          return response === "granted";
+        }
+        return true;
+      }
+
+      function onGeolocation(position) {
+        clientSensorsActive = true;
+        MAP_CONFIG.user_lat = position.coords.latitude;
+        MAP_CONFIG.user_lon = position.coords.longitude;
+        MAP_CONFIG.user_accuracy = position.coords.accuracy;
+        if (
+          position.coords.heading != null &&
+          Number.isFinite(position.coords.heading) &&
+          position.coords.heading >= 0
+        ) {
+          MAP_CONFIG.user_heading = position.coords.heading;
+        }
+        drawUserMarker();
+      }
+
+      function onGeolocationError(error) {
+        const readout = document.getElementById("nav-readout");
+        if (readout) {
+          readout.textContent = `Location error: ${error.message}`;
+          readout.className = "nav-readout warn";
+        }
+        document.getElementById("perm-banner").classList.remove("hidden");
+      }
+
+      function startClientSensors() {
+        if (!navigator.geolocation) {
+          onGeolocationError({ message: "Geolocation is not supported on this device." });
+          return;
+        }
+
+        if (geoWatchId != null) {
+          navigator.geolocation.clearWatch(geoWatchId);
+        }
+
+        geoWatchId = navigator.geolocation.watchPosition(
+          onGeolocation,
+          onGeolocationError,
+          {
+            enableHighAccuracy: true,
+            maximumAge: 500,
+            timeout: 15000,
+          }
+        );
+
+        window.addEventListener("deviceorientation", onDeviceOrientation, true);
+        document.getElementById("perm-banner").classList.add("hidden");
+      }
+
+      async function enableClientSensors() {
+        try {
+          const orientationGranted = await requestOrientationPermission();
+          if (!orientationGranted) {
+            const readout = document.getElementById("nav-readout");
+            if (readout) {
+              readout.textContent =
+                "Compass permission denied. You can still see distance, but not facing direction.";
+              readout.className = "nav-readout warn";
+            }
+          }
+        } catch (error) {
+          // Continue with geolocation even if compass permission fails.
+        }
+        startClientSensors();
       }
 
       function handleMapMessage(data) {
@@ -177,12 +578,22 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         if (data.action === "updateTarget") {
           if (data.target_point != null) {
             MAP_CONFIG.target_point = data.target_point;
-            drawGridMarkers();
           }
+          if (data.target_lat != null) {
+            MAP_CONFIG.target_lat = Number(data.target_lat);
+          }
+          if (data.target_lon != null) {
+            MAP_CONFIG.target_lon = Number(data.target_lon);
+          }
+          drawGridMarkers();
+          updateNavigationHud();
           return;
         }
 
         if (data.action === "updateUser") {
+          if (clientSensorsActive) {
+            return;
+          }
           const nextLat = Number(data.user_lat);
           const nextLon = Number(data.user_lon);
           if (
@@ -212,10 +623,19 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       }).addTo(map);
 
       const gridLayer = L.layerGroup().addTo(map);
+      const facingLayer = L.layerGroup().addTo(map);
       const userMarker = L.layerGroup().addTo(map);
 
       drawGridMarkers();
       drawUserMarker();
+
+      if (isLikelyDesktop() || typeof DeviceOrientationEvent === "undefined") {
+        showDesktopOrientationWarning();
+      }
+
+      document
+        .getElementById("enable-sensors")
+        .addEventListener("click", enableClientSensors);
 
       try {
         if (typeof BroadcastChannel !== "undefined") {
@@ -251,6 +671,154 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 """
 
 
+_LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: sans-serif;
+      }
+
+      .panel {
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 8px;
+        padding: 12px 14px;
+        background: #fafafa;
+      }
+
+      .metric-row {
+        display: flex;
+        gap: 12px;
+      }
+
+      .metric {
+        flex: 1;
+        background: #fff;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+
+      .metric-label {
+        font-size: 12px;
+        color: #666;
+        margin-bottom: 4px;
+      }
+
+      .metric-value {
+        font-size: 20px;
+        font-weight: 600;
+        color: #222;
+      }
+
+      .status {
+        margin-top: 10px;
+        font-size: 14px;
+        color: #444;
+      }
+
+      .status.success {
+        color: #1b5e20;
+        font-weight: 600;
+      }
+
+      .status.warn {
+        color: #e65100;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <div class="metric-row">
+        <div class="metric">
+          <div class="metric-label">Distance to Target</div>
+          <div id="distance-value" class="metric-value">--</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Direction</div>
+          <div id="direction-value" class="metric-value">--</div>
+        </div>
+      </div>
+      <div id="status-line" class="status">Enable location and compass on the map above.</div>
+    </div>
+    <script>
+      const NAV_MESSAGE_TYPE = "gps-stick-nav";
+      const directionLabels = {
+        forward: "Head forward",
+        back: "Head back",
+        left: "Head left",
+        right: "Head right",
+      };
+
+      function updatePanel(payload) {
+        const distanceValue = document.getElementById("distance-value");
+        const directionValue = document.getElementById("direction-value");
+        const statusLine = document.getElementById("status-line");
+
+        if (payload.reached) {
+          distanceValue.textContent = "0.00 m";
+          directionValue.textContent = "Arrived";
+          statusLine.textContent = "TARGET REACHED (within 1.5 cm)!";
+          statusLine.className = "status success";
+          return;
+        }
+
+        if (payload.distance != null) {
+          distanceValue.textContent = `${Number(payload.distance).toFixed(2)} m`;
+        }
+
+        if (payload.direction) {
+          directionValue.textContent = directionLabels[payload.direction];
+          statusLine.textContent = `${directionLabels[payload.direction]} for ${Number(payload.distance).toFixed(2)} meters`;
+          statusLine.className = "status";
+        } else if (payload.desktopNoOrientation) {
+          directionValue.textContent = "Unavailable";
+          statusLine.textContent =
+            "Desktop detected: compass orientation is not available. Use a phone or tablet for direction guidance.";
+          statusLine.className = "status warn";
+        } else {
+          directionValue.textContent = "--";
+          statusLine.textContent = "Waiting for compass heading from this device.";
+          statusLine.className = "status warn";
+        }
+
+        if (payload.accuracy != null && Number(payload.accuracy) > 5) {
+          statusLine.textContent += " GPS accuracy is low.";
+          statusLine.className = "status warn";
+        }
+      }
+
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
+          navChannel.onmessage = (event) => {
+            updatePanel(event.data || {});
+          };
+        }
+      } catch (error) {
+        // Ignore channel errors on older browsers.
+      }
+
+      (function showDesktopWarningOnLoad() {
+        const ua = navigator.userAgent || "";
+        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
+        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
+        const likelyDesktop = !mobile && !hasTouch;
+        if (likelyDesktop || typeof DeviceOrientationEvent === "undefined") {
+          updatePanel({ desktopNoOrientation: true });
+        }
+      })();
+    </script>
+  </body>
+</html>
+"""
+
+
 def _encode_map_payload(payload):
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
@@ -260,6 +828,8 @@ def render_live_field_map(
     target_point,
     user_lat,
     user_lon,
+    target_lat,
+    target_lon,
     center_lat,
     center_lon,
     zoom=19,
@@ -268,8 +838,12 @@ def render_live_field_map(
     config = {
         "grid_points": grid_points,
         "target_point": target_point,
+        "target_lat": target_lat,
+        "target_lon": target_lon,
         "user_lat": user_lat,
         "user_lon": user_lon,
+        "user_heading": None,
+        "user_accuracy": None,
         "center_lat": center_lat,
         "center_lon": center_lon,
         "zoom": zoom,
@@ -279,6 +853,10 @@ def render_live_field_map(
         .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
     )
     components.html(html, height=height, scrolling=False)
+
+
+def render_live_nav_panel(height=120):
+    components.html(_LIVE_NAV_PANEL_HTML, height=height, scrolling=False)
 
 
 def post_user_position_update(user_lat, user_lon, session_key):
@@ -506,6 +1084,7 @@ if not st.session_state.grid_finalized:
             )
             st.session_state.placement_map_mounted = False
             st.session_state.live_map_mounted = False
+            st.session_state.live_nav_panel_mounted = False
             st.rerun()
 
 else:
@@ -518,6 +1097,7 @@ else:
         st.session_state.grid_finalized = False
         st.session_state.placement_map_mounted = False
         st.session_state.live_map_mounted = False
+        st.session_state.live_nav_panel_mounted = False
         st.rerun()
 
     grid_points = [
@@ -526,12 +1106,18 @@ else:
     ]
 
     st.subheader("Live Field View")
+    st.caption(
+        "Tap **Enable location & compass** on the map. Navigation uses this device's GPS "
+        "and compass — directions are relative to the way you are facing."
+    )
     if not st.session_state.get("live_map_mounted"):
         render_live_field_map(
             grid_points=grid_points,
             target_point=target_point,
             user_lat=current_lat,
             user_lon=current_lon,
+            target_lat=target_lat,
+            target_lon=target_lon,
             center_lat=target_lat,
             center_lon=target_lon,
             zoom=19,
@@ -539,37 +1125,15 @@ else:
         )
         st.session_state.live_map_mounted = True
         st.session_state.live_map_target = target_point
-        st.session_state.live_user_pos = (current_lat, current_lon)
     elif st.session_state.get("live_map_target") != target_point:
         st.session_state.live_map_target = target_point
         post_map_message({
             "action": "updateTarget",
             "target_point": target_point,
+            "target_lat": target_lat,
+            "target_lon": target_lon,
         })
 
-    @st.fragment(run_every=0.5)
-    def render_live_dashboard(t_lat, t_lon, t_name):
-        msg = poll_gps()
-        if msg is None:
-            st.info("Waiting for GPS fix...")
-            return
-
-        c_lat, c_lon = float(msg.latitude), float(msg.longitude)
-        dist, bear = get_distance_and_bearing(c_lat, c_lon, t_lat, t_lon)
-
-        if int(msg.gps_qual) in [0, 1]:
-            st.warning("RTK fix Quality is low. Please check your base station connection.")
-
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        col1.metric(label="Distance to Target", value=f"{dist:.2f} m")
-        col2.metric(label="Required Heading", value=f"{bear:.1f}°")
-
-        if dist < 0.015:
-            st.success("TARGET REACHED (Within 1.5cm RTK tolerance)!")
-        else:
-            st.info(f"Walk towards {bear:.1f}° for {dist:.2f} meters")
-
-        post_user_position_update(c_lat, c_lon, "live_user_pos")
-
-    render_live_dashboard(target_lat, target_lon, target_point)
+    if not st.session_state.get("live_nav_panel_mounted"):
+        render_live_nav_panel()
+        st.session_state.live_nav_panel_mounted = True
