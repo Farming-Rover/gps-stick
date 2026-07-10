@@ -983,7 +983,7 @@ def finalize_grid_location(line_count_m, line_count_e, spacing):
 
 # --- STREAMLIT UI LAYOUT ---
 st.set_page_config(page_title="RTK Live Map Guide", layout="wide")
-st.title("RTK Live Map Guide")
+st.title("RTK Live Map Guide0")
 
 if st.session_state.get("last_gps_msg") is None:
     msg = poll_gps(block_until_fix=True, timeout_s=10)
@@ -1036,7 +1036,7 @@ if not st.session_state.grid_finalized:
     st.caption(
         "Pan and zoom the map to slide the terrain under the preview grid. "
         "The grid origin (R1C1, green) stays at the map center. "
-        "Click **Apply grid origin** on the map, then **Finalize grid location**."
+        "Click **Finalize grid location** to confirm the grid position."
     )
 
     if not st.session_state.placement_map_mounted:
