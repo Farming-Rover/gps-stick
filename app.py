@@ -7,9 +7,13 @@ import pandas as pd
 import pynmea2
 import serial
 import streamlit as st
-import streamlit.components.v1 as components
 
-from placement_map_html import MAP_MESSAGE_TYPE, post_map_message, render_placement_map
+from placement_map_html import (
+    MAP_MESSAGE_TYPE,
+    post_map_message,
+    render_html_embed,
+    render_placement_map,
+)
 # Serial Port Configuration
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
@@ -211,14 +215,14 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
       <div id="map"></div>
       <div id="perm-banner" class="perm-banner">
-        <p>Allow this device to use your location and compass so the map can show where you are facing.</p>
-        <button id="enable-sensors" type="button">Enable location &amp; compass</button>
+        <p>Allow this device to use its compass so the map can show where you are facing. Your position comes from the RTK receiver on the stick.</p>
+        <button id="enable-sensors" type="button">Enable compass</button>
       </div>
-      <div id="desktop-warn" class="perm-banner desktop-warn hidden">
-        <p>Desktop browsers usually do not provide compass orientation. Use a phone or tablet to see which way you are facing and get forward/back/left/right directions.</p>
+      <div id="sensor-warn" class="perm-banner desktop-warn hidden">
+        <p id="sensor-warn-text"></p>
       </div>
       <div class="map-hud">
-        <div id="nav-readout" class="nav-readout">Waiting for device location...</div>
+        <div id="nav-readout" class="nav-readout">Waiting for RTK position from the receiver...</div>
       </div>
     </div>
 
@@ -234,9 +238,8 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       );
 
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
-      let clientSensorsActive = false;
-      let geoWatchId = null;
-      let desktopNoOrientation = false;
+      let sensorIssue = null; // "insecure" | "desktop" | "no-compass"
+      let orientationEventSeen = false;
 
       function isLikelyDesktop() {
         const ua = navigator.userAgent || "";
@@ -245,17 +248,19 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         return !mobile && !hasTouch;
       }
 
-      function showDesktopOrientationWarning() {
-        desktopNoOrientation = true;
-        const banner = document.getElementById("desktop-warn");
-        if (banner) {
+      function showSensorWarning(issue, text) {
+        sensorIssue = issue;
+        const banner = document.getElementById("sensor-warn");
+        const bannerText = document.getElementById("sensor-warn-text");
+        if (banner && bannerText) {
+          bannerText.textContent = text;
           banner.classList.remove("hidden");
         }
         publishNavUpdate({
           distance: null,
           direction: null,
           reached: false,
-          desktopNoOrientation: true,
+          sensorIssue: issue,
         });
       }
 
@@ -336,25 +341,53 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         }
       }
 
+      function refreshNearestTarget(userLat, userLon) {
+        let nearest = null;
+        let nearestDistance = Infinity;
+        MAP_CONFIG.grid_points.forEach((point) => {
+          const { distance } = getDistanceAndBearing(
+            userLat,
+            userLon,
+            point.lat,
+            point.lon
+          );
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = point;
+          }
+        });
+
+        if (nearest && nearest.point !== MAP_CONFIG.target_point) {
+          MAP_CONFIG.target_point = nearest.point;
+          MAP_CONFIG.target_lat = nearest.lat;
+          MAP_CONFIG.target_lon = nearest.lon;
+          drawGridMarkers();
+        }
+      }
+
       function updateNavigationHud() {
         const readout = document.getElementById("nav-readout");
         if (!readout) {
           return;
         }
 
-        const targetLat = Number(MAP_CONFIG.target_lat);
-        const targetLon = Number(MAP_CONFIG.target_lon);
         const userLat = Number(MAP_CONFIG.user_lat);
         const userLon = Number(MAP_CONFIG.user_lon);
 
-        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
-          readout.textContent = "Select a target grid point.";
+        if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
+          readout.textContent = "Waiting for RTK position from the receiver...";
           readout.className = "nav-readout";
           return;
         }
 
-        if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
-          readout.textContent = "Waiting for device location...";
+        refreshNearestTarget(userLat, userLon);
+
+        const targetLat = Number(MAP_CONFIG.target_lat);
+        const targetLon = Number(MAP_CONFIG.target_lon);
+        const targetName = MAP_CONFIG.target_point;
+
+        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
+          readout.textContent = "No grid points available.";
           readout.className = "nav-readout";
           return;
         }
@@ -367,12 +400,13 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         );
 
         if (distance < 0.015) {
-          readout.textContent = "TARGET REACHED (within 1.5 cm)!";
+          readout.textContent = `${targetName} REACHED (within 1.5 cm)!`;
           readout.className = "nav-readout reached";
           publishNavUpdate({
             distance,
             direction: "forward",
             reached: true,
+            target: targetName,
             accuracy: MAP_CONFIG.user_accuracy,
           });
           return;
@@ -389,33 +423,34 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 
         const heading = Number(MAP_CONFIG.user_heading);
         if (!Number.isFinite(heading)) {
-          if (desktopNoOrientation) {
-            readout.textContent =
-              `${distance.toFixed(2)} m to target · compass not available on desktop` +
-              accuracyNote;
-          } else {
-            readout.textContent =
-              `${distance.toFixed(2)} m to target · enable compass for directions` +
-              accuracyNote;
-          }
+          const headingHint = {
+            insecure: "open the app over HTTPS for compass directions",
+            desktop: "compass not available on desktop",
+            "no-compass": "compass not available on this device",
+          }[sensorIssue] || "tap Enable compass for directions";
+          readout.textContent =
+            `${distance.toFixed(2)} m to ${targetName} · ${headingHint}` +
+            accuracyNote;
           publishNavUpdate({
             distance,
             direction: null,
             reached: false,
+            target: targetName,
             accuracy,
-            desktopNoOrientation,
+            sensorIssue,
           });
           return;
         }
 
         const direction = getRelativeDirection(heading, bearing);
         readout.textContent =
-          `${directionLabel(direction)} · ${distance.toFixed(2)} m to target` +
+          `${directionLabel(direction)} · ${distance.toFixed(2)} m to ${targetName}` +
           accuracyNote;
         publishNavUpdate({
           distance,
           direction,
           reached: false,
+          target: targetName,
           accuracy,
         });
       }
@@ -476,22 +511,84 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         updateNavigationHud();
       }
 
-      function getCompassHeading(event) {
-        if (event.webkitCompassHeading != null && Number.isFinite(event.webkitCompassHeading)) {
-          return event.webkitCompassHeading;
+      // Heading filter state. Android fires BOTH deviceorientationabsolute
+      // (true north) and plain deviceorientation (relative, arbitrary zero);
+      // mixing them makes the heading jump. Once an absolute source is seen,
+      // relative readings are discarded.
+      let hasAbsoluteHeading = false;
+      let headingSin = null;
+      let headingCos = null;
+      let lastHeadingDrawMs = 0;
+      const HEADING_SMOOTHING = 0.25; // 0..1, lower = smoother but laggier
+      const HEADING_REDRAW_MS = 100;
+      const HEADING_MIN_DELTA_DEG = 1.5;
+
+      function extractHeading(event) {
+        // iOS Safari: true compass heading, already in degrees from north.
+        if (
+          event.webkitCompassHeading != null &&
+          Number.isFinite(event.webkitCompassHeading)
+        ) {
+          return { heading: event.webkitCompassHeading, absolute: true };
         }
         if (event.alpha != null && Number.isFinite(event.alpha)) {
-          return (360 - event.alpha) % 360;
+          const absolute =
+            event.absolute === true || event.type === "deviceorientationabsolute";
+          return { heading: (360 - event.alpha) % 360, absolute };
         }
         return null;
       }
 
       function onDeviceOrientation(event) {
-        const heading = getCompassHeading(event);
-        if (heading == null) {
+        orientationEventSeen = true;
+        if (sensorIssue === "no-compass") {
+          sensorIssue = null;
+          const banner = document.getElementById("sensor-warn");
+          if (banner) {
+            banner.classList.add("hidden");
+          }
+        }
+
+        const reading = extractHeading(event);
+        if (reading == null) {
           return;
         }
-        MAP_CONFIG.user_heading = heading;
+
+        if (reading.absolute) {
+          hasAbsoluteHeading = true;
+        } else if (hasAbsoluteHeading) {
+          // A north-referenced source exists; ignore relative readings.
+          return;
+        }
+
+        // Low-pass filter on the heading's unit vector. Filtering sin/cos
+        // instead of degrees handles the 359°->0° wraparound correctly and
+        // absorbs magnetometer jitter.
+        const rad = (reading.heading * Math.PI) / 180;
+        if (headingSin == null) {
+          headingSin = Math.sin(rad);
+          headingCos = Math.cos(rad);
+        } else {
+          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
+          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
+        }
+        const smoothed =
+          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360;
+
+        // Sensors fire up to 60 Hz; cap redraws and skip imperceptible changes.
+        const now = Date.now();
+        if (now - lastHeadingDrawMs < HEADING_REDRAW_MS) {
+          return;
+        }
+        const previous = Number(MAP_CONFIG.user_heading);
+        if (Number.isFinite(previous)) {
+          const delta = Math.abs(((smoothed - previous + 540) % 360) - 180);
+          if (delta < HEADING_MIN_DELTA_DEG) {
+            return;
+          }
+        }
+        lastHeadingDrawMs = now;
+        MAP_CONFIG.user_heading = smoothed;
         drawUserMarker();
       }
 
@@ -506,51 +603,28 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         return true;
       }
 
-      function onGeolocation(position) {
-        clientSensorsActive = true;
-        MAP_CONFIG.user_lat = position.coords.latitude;
-        MAP_CONFIG.user_lon = position.coords.longitude;
-        MAP_CONFIG.user_accuracy = position.coords.accuracy;
-        if (
-          position.coords.heading != null &&
-          Number.isFinite(position.coords.heading) &&
-          position.coords.heading >= 0
-        ) {
-          MAP_CONFIG.user_heading = position.coords.heading;
+      function startCompass() {
+        // Android Chrome delivers true-north headings via the "absolute"
+        // event; iOS Safari only fires plain deviceorientation (with
+        // webkitCompassHeading). Listen to both and let whichever fires win.
+        if ("ondeviceorientationabsolute" in window) {
+          window.addEventListener(
+            "deviceorientationabsolute",
+            onDeviceOrientation,
+            true
+          );
         }
-        drawUserMarker();
-      }
-
-      function onGeolocationError(error) {
-        const readout = document.getElementById("nav-readout");
-        if (readout) {
-          readout.textContent = `Location error: ${error.message}`;
-          readout.className = "nav-readout warn";
-        }
-        document.getElementById("perm-banner").classList.remove("hidden");
-      }
-
-      function startClientSensors() {
-        if (!navigator.geolocation) {
-          onGeolocationError({ message: "Geolocation is not supported on this device." });
-          return;
-        }
-
-        if (geoWatchId != null) {
-          navigator.geolocation.clearWatch(geoWatchId);
-        }
-
-        geoWatchId = navigator.geolocation.watchPosition(
-          onGeolocation,
-          onGeolocationError,
-          {
-            enableHighAccuracy: true,
-            maximumAge: 500,
-            timeout: 15000,
-          }
-        );
-
         window.addEventListener("deviceorientation", onDeviceOrientation, true);
+
+        setTimeout(() => {
+          if (!orientationEventSeen && sensorIssue == null) {
+            showSensorWarning(
+              "no-compass",
+              "No compass data is coming from this device. Distance still works, but facing direction will be unavailable."
+            );
+          }
+        }, 4000);
+
         document.getElementById("perm-banner").classList.add("hidden");
       }
 
@@ -566,9 +640,9 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
             }
           }
         } catch (error) {
-          // Continue with geolocation even if compass permission fails.
+          // Still attach listeners; some browsers fire events without the prompt.
         }
-        startClientSensors();
+        startCompass();
       }
 
       function handleMapMessage(data) {
@@ -576,25 +650,7 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           return;
         }
 
-        if (data.action === "updateTarget") {
-          if (data.target_point != null) {
-            MAP_CONFIG.target_point = data.target_point;
-          }
-          if (data.target_lat != null) {
-            MAP_CONFIG.target_lat = Number(data.target_lat);
-          }
-          if (data.target_lon != null) {
-            MAP_CONFIG.target_lon = Number(data.target_lon);
-          }
-          drawGridMarkers();
-          updateNavigationHud();
-          return;
-        }
-
         if (data.action === "updateUser") {
-          if (clientSensorsActive) {
-            return;
-          }
           const nextLat = Number(data.user_lat);
           const nextLon = Number(data.user_lon);
           if (
@@ -614,14 +670,18 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         center: [MAP_CONFIG.center_lat, MAP_CONFIG.center_lon],
         zoom: MAP_CONFIG.zoom,
         zoomControl: true,
-        maxZoom: 21,
+        maxZoom: 25,
       });
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: "&copy; OpenStreetMap contributors",
-        maxZoom: 21,
+        maxZoom: 25,
         maxNativeZoom: 19,
       }).addTo(map);
+
+      L.control
+        .scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 120 })
+        .addTo(map);
 
       const gridLayer = L.layerGroup().addTo(map);
       const facingLayer = L.layerGroup().addTo(map);
@@ -630,8 +690,19 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       drawGridMarkers();
       drawUserMarker();
 
-      if (isLikelyDesktop() || typeof DeviceOrientationEvent === "undefined") {
-        showDesktopOrientationWarning();
+      // Browsers remove geolocation and orientation APIs entirely on plain
+      // HTTP (except localhost), so check the secure context before blaming
+      // the device type.
+      if (!window.isSecureContext) {
+        showSensorWarning(
+          "insecure",
+          "This page is served over HTTP, so the browser blocks compass access. Position from the RTK receiver still works, but open the app via HTTPS for facing direction."
+        );
+      } else if (isLikelyDesktop()) {
+        showSensorWarning(
+          "desktop",
+          "Desktop browsers usually do not provide compass orientation. Use a phone or tablet to see which way you are facing and get forward/back/left/right directions."
+        );
       }
 
       document
@@ -745,7 +816,7 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
           <div id="direction-value" class="metric-value">--</div>
         </div>
       </div>
-      <div id="status-line" class="status">Enable location and compass on the map above.</div>
+      <div id="status-line" class="status">Enable the compass on the map above. Position comes from the RTK receiver.</div>
     </div>
     <script>
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
@@ -760,11 +831,12 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         const distanceValue = document.getElementById("distance-value");
         const directionValue = document.getElementById("direction-value");
         const statusLine = document.getElementById("status-line");
+        const targetSuffix = payload.target ? ` to ${payload.target}` : "";
 
         if (payload.reached) {
           distanceValue.textContent = "0.00 m";
           directionValue.textContent = "Arrived";
-          statusLine.textContent = "TARGET REACHED (within 1.5 cm)!";
+          statusLine.textContent = `${payload.target || "TARGET"} REACHED (within 1.5 cm)!`;
           statusLine.className = "status success";
           return;
         }
@@ -775,12 +847,22 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
 
         if (payload.direction) {
           directionValue.textContent = directionLabels[payload.direction];
-          statusLine.textContent = `${directionLabels[payload.direction]} for ${Number(payload.distance).toFixed(2)} meters`;
+          statusLine.textContent = `${directionLabels[payload.direction]} for ${Number(payload.distance).toFixed(2)} meters${targetSuffix}`;
           statusLine.className = "status";
-        } else if (payload.desktopNoOrientation) {
+        } else if (payload.sensorIssue === "insecure") {
+          directionValue.textContent = "Unavailable";
+          statusLine.textContent =
+            "The browser blocks the compass over plain HTTP. Distance from the RTK receiver still works; open the app via HTTPS for directions.";
+          statusLine.className = "status warn";
+        } else if (payload.sensorIssue === "desktop") {
           directionValue.textContent = "Unavailable";
           statusLine.textContent =
             "Desktop detected: compass orientation is not available. Use a phone or tablet for direction guidance.";
+          statusLine.className = "status warn";
+        } else if (payload.sensorIssue === "no-compass") {
+          directionValue.textContent = "Unavailable";
+          statusLine.textContent =
+            "This device is not reporting compass data. Distance still works, but facing direction is unavailable.";
           statusLine.className = "status warn";
         } else {
           directionValue.textContent = "--";
@@ -805,13 +887,16 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         // Ignore channel errors on older browsers.
       }
 
-      (function showDesktopWarningOnLoad() {
+      (function showSensorWarningOnLoad() {
+        if (!window.isSecureContext) {
+          updatePanel({ sensorIssue: "insecure" });
+          return;
+        }
         const ua = navigator.userAgent || "";
         const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
         const hasTouch = (navigator.maxTouchPoints || 0) > 0;
-        const likelyDesktop = !mobile && !hasTouch;
-        if (likelyDesktop || typeof DeviceOrientationEvent === "undefined") {
-          updatePanel({ desktopNoOrientation: true });
+        if (!mobile && !hasTouch) {
+          updatePanel({ sensorIssue: "desktop" });
         }
       })();
     </script>
@@ -826,21 +911,19 @@ def _encode_map_payload(payload):
 
 def render_live_field_map(
     grid_points,
-    target_point,
     user_lat,
     user_lon,
-    target_lat,
-    target_lon,
     center_lat,
     center_lon,
     zoom=19,
     height=520,
 ):
+    # The nearest grid point is picked client-side and updated as you move.
     config = {
         "grid_points": grid_points,
-        "target_point": target_point,
-        "target_lat": target_lat,
-        "target_lon": target_lon,
+        "target_point": None,
+        "target_lat": None,
+        "target_lon": None,
         "user_lat": user_lat,
         "user_lon": user_lon,
         "user_heading": None,
@@ -853,23 +936,24 @@ def render_live_field_map(
         _LIVE_FIELD_MAP_HTML.replace("__MAP_CONFIG_B64__", _encode_map_payload(config))
         .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
     )
-    components.html(html, height=height, scrolling=False)
+    render_html_embed(html, height=height)
 
 
 def render_live_nav_panel(height=120):
-    components.html(_LIVE_NAV_PANEL_HTML, height=height, scrolling=False)
+    render_html_embed(_LIVE_NAV_PANEL_HTML, height=height)
 
 
 def post_user_position_update(user_lat, user_lon, session_key):
     """Push a GPS position to mounted maps without remounting them."""
-    position = (user_lat, user_lon)
+    # Round to ~1 cm so RTK jitter doesn't trigger a new message every poll.
+    position = (round(user_lat, 7), round(user_lon, 7))
     if st.session_state.get(session_key) == position:
         return
     st.session_state[session_key] = position
     post_map_message({
         "action": "updateUser",
-        "user_lat": user_lat,
-        "user_lon": user_lon,
+        "user_lat": position[0],
+        "user_lon": position[1],
     })
 
 # --- LIVE HARDWARE GPS ---
@@ -918,7 +1002,9 @@ def poll_gps(block_until_fix=False, timeout_s=5.0):
     if ser is None:
         return st.session_state.get("last_gps_msg")
 
-    deadline = time.time() + (timeout_s if block_until_fix else 0)
+    # Non-blocking polls get a hard time budget so serial reads can't stall
+    # the Streamlit session (fragments in a session run one at a time).
+    deadline = time.time() + (timeout_s if block_until_fix else 0.15)
 
     while True:
         try:
@@ -938,6 +1024,9 @@ def poll_gps(block_until_fix=False, timeout_s=5.0):
             if time.time() >= deadline:
                 break
             continue
+
+        if time.time() >= deadline:
+            break
 
         try:
             if not line or ser.in_waiting == 0:
@@ -984,7 +1073,7 @@ def finalize_grid_location(line_count_m, line_count_e, spacing):
 
 # --- STREAMLIT UI LAYOUT ---
 st.set_page_config(page_title="RTK Live Map Guide", layout="wide")
-st.title("RTK Live Map Guide0")
+st.title("RTK Live Map Guide")
 
 if st.session_state.get("last_gps_msg") is None:
     msg = poll_gps(block_until_fix=True, timeout_s=10)
@@ -1021,12 +1110,15 @@ with st.sidebar:
                 "zoom": st.session_state.map_zoom,
             })
 
-        post_map_message({
-            "action": "updateGrid",
-            "dim_m": int(grid_lines_m),
-            "dim_e": int(grid_lines_e),
-            "spacing_m": float(spacing),
-        })
+        grid_config = (int(grid_lines_m), int(grid_lines_e), float(spacing))
+        if st.session_state.get("last_grid_config_sent") != grid_config:
+            st.session_state.last_grid_config_sent = grid_config
+            post_map_message({
+                "action": "updateGrid",
+                "dim_m": grid_config[0],
+                "dim_e": grid_config[1],
+                "spacing_m": grid_config[2],
+            })
 
     render_grid_settings(current_lat, current_lon)
 
@@ -1036,7 +1128,7 @@ if not st.session_state.grid_finalized:
     st.subheader("Position Your Grid")
     st.caption(
         "Pan and zoom the map to slide the terrain under the preview grid. "
-        "The grid origin (R1C1, green) stays at the map center. "
+        "The grid origin (in green) stays at the map center. "
         "Click **Finalize grid location** to confirm the grid position."
     )
 
@@ -1071,11 +1163,7 @@ if not st.session_state.grid_finalized:
 
     col_info, col_finalize = st.columns([2, 1])
     with col_info:
-        st.markdown(
-            f"**Preview origin (R1C1):** "
-            f"{st.session_state.preview_origin_lat:.8f}, {st.session_state.preview_origin_lon:.8f}"
-        )
-        st.markdown("**Legend:** green = grid origin (R1C1) · blue = preview points · red = your position")
+        st.markdown("**Legend:** green = grid origin · blue = preview points · red = your position")
     with col_finalize:
         if st.button("Finalize grid location", type="primary", use_container_width=True):
             finalize_grid_location(
@@ -1090,9 +1178,6 @@ if not st.session_state.grid_finalized:
 
 else:
     df = st.session_state.grid_df
-    target_point = st.selectbox("Select Target Grid Point:", df["Point"].tolist())
-    target_row = df[df["Point"] == target_point].iloc[0]
-    target_lat, target_lon = target_row["lat"], target_row["lon"]
 
     if st.button("Adjust grid placement"):
         st.session_state.grid_finalized = False
@@ -1108,33 +1193,37 @@ else:
 
     st.subheader("Live Field View")
     st.caption(
-        "Tap **Enable location & compass** on the map. Navigation uses this device's GPS "
-        "and compass — directions are relative to the way you are facing."
+        "Tap **Enable compass** on the map. Your position comes from the RTK receiver on "
+        "the stick; you are guided to the nearest grid point (highlighted green), and "
+        "directions are relative to the way you are facing."
     )
     if not st.session_state.get("live_map_mounted"):
         render_live_field_map(
             grid_points=grid_points,
-            target_point=target_point,
             user_lat=current_lat,
             user_lon=current_lon,
-            target_lat=target_lat,
-            target_lon=target_lon,
-            center_lat=target_lat,
-            center_lon=target_lon,
+            center_lat=current_lat,
+            center_lon=current_lon,
             zoom=19,
             height=520,
         )
         st.session_state.live_map_mounted = True
-        st.session_state.live_map_target = target_point
-    elif st.session_state.get("live_map_target") != target_point:
-        st.session_state.live_map_target = target_point
-        post_map_message({
-            "action": "updateTarget",
-            "target_point": target_point,
-            "target_lat": target_lat,
-            "target_lon": target_lon,
-        })
 
     if not st.session_state.get("live_nav_panel_mounted"):
         render_live_nav_panel()
         st.session_state.live_nav_panel_mounted = True
+
+    @st.fragment(run_every=0.5)
+    def refresh_live_user_marker():
+        msg = poll_gps()
+        if msg is None:
+            return
+        if int(msg.gps_qual) in [0, 1]:
+            st.warning("RTK fix quality is low. Please check your base station connection.")
+        post_user_position_update(
+            float(msg.latitude),
+            float(msg.longitude),
+            "live_user_pos",
+        )
+
+    refresh_live_user_marker()

@@ -1,9 +1,22 @@
 import base64
 import json
 
+import streamlit as st
 import streamlit.components.v1 as components
 
 MAP_MESSAGE_TYPE = "gps-stick-map"
+
+
+def render_html_embed(html: str, height: int) -> None:
+    """Render raw HTML in an iframe via st.iframe (components.v1.html is deprecated).
+
+    Falls back to components.html on Streamlit versions without st.iframe.
+    """
+    if hasattr(st, "iframe"):
+        # st.iframe rejects 0; a 1 px iframe is invisible for the hidden messenger.
+        st.iframe(html, height=max(int(height), 1))
+    else:
+        components.html(html, height=height, scrolling=False)
 
 _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -174,8 +187,7 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
       function updateOriginReadout(lat, lng, zoom) {
         const readout = document.getElementById("origin-readout");
         readout.textContent =
-          `R1C1: ${lat.toFixed(8)}, ${lng.toFixed(8)} · ` +
-          `${asCount(MAP_CONFIG.dim_m, 4)}x${asCount(MAP_CONFIG.dim_e, 4)} · zoom ${zoom}`;
+          `${asCount(MAP_CONFIG.dim_m, 4)}x${asCount(MAP_CONFIG.dim_e, 4)} grid`;
       }
 
       function drawGrid(originLat, originLon) {
@@ -244,9 +256,22 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
       }
 
       function applyUpdateGrid(data) {
+        const prevM = MAP_CONFIG.dim_m;
+        const prevE = MAP_CONFIG.dim_e;
+        const prevSpacing = MAP_CONFIG.spacing_m;
+
         if (data.dim_m != null) MAP_CONFIG.dim_m = asCount(data.dim_m, 4);
         if (data.dim_e != null) MAP_CONFIG.dim_e = asCount(data.dim_e, 4);
         if (data.spacing_m != null) MAP_CONFIG.spacing_m = Number(data.spacing_m);
+
+        // Duplicate messages arrive from the sender's retries; skip no-op redraws.
+        if (
+          prevM === MAP_CONFIG.dim_m &&
+          prevE === MAP_CONFIG.dim_e &&
+          prevSpacing === MAP_CONFIG.spacing_m
+        ) {
+          return;
+        }
 
         const center = map.getCenter();
         drawGrid(center.lat, center.lng);
@@ -301,14 +326,18 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
         center: [MAP_CONFIG.center_lat, MAP_CONFIG.center_lon],
         zoom: MAP_CONFIG.zoom,
         zoomControl: true,
-        maxZoom: 21,
+        maxZoom: 25,
       });
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: "&copy; OpenStreetMap contributors",
-        maxZoom: 21,
+        maxZoom: 25,
         maxNativeZoom: 19,
       }).addTo(map);
+
+      L.control
+        .scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 120 })
+        .addTo(map);
 
       const gridLayer = L.layerGroup().addTo(map);
       const userMarker = L.layerGroup().addTo(map);
@@ -324,9 +353,10 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
         MAP_CONFIG.zoom
       );
 
-      document
-        .getElementById("apply-origin")
-        .addEventListener("click", pushViewportToStreamlit);
+      const applyOriginBtn = document.getElementById("apply-origin");
+      if (applyOriginBtn) {
+        applyOriginBtn.addEventListener("click", pushViewportToStreamlit);
+      }
 
       try {
         if (typeof BroadcastChannel !== "undefined") {
@@ -370,7 +400,7 @@ def post_map_message(payload: dict) -> None:
     """Send a lightweight update to the mounted map iframe without remounting it."""
     message_b64 = _encode_payload({"type": MAP_MESSAGE_TYPE, **payload})
     channel_name = json.dumps(MAP_MESSAGE_TYPE)
-    components.html(
+    render_html_embed(
         f"""
         <div data-msg-b64="{message_b64}" id="gps-stick-msg" hidden></div>
         <script>
@@ -391,12 +421,13 @@ def post_map_message(payload: dict) -> None:
             }} catch (error) {{}}
           }}
           send();
-          setTimeout(send, 75);
-          setTimeout(send, 250);
+          setTimeout(send, 30);
+          setTimeout(send, 120);
+          setTimeout(send, 300);
         }})();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -425,4 +456,4 @@ def render_placement_map(
         _PLACEMENT_MAP_HTML.replace("__MAP_CONFIG_B64__", _encode_payload(config))
         .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
     )
-    components.html(html, height=height, scrolling=False)
+    render_html_embed(html, height=height)
