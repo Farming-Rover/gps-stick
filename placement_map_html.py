@@ -157,7 +157,8 @@ _PLACEMENT_MAP_HTML = """<!DOCTYPE html>
         const points = [];
 
         for (let indexM = 0; indexM < countM; indexM++) {
-          const offset = indexM % 2 === 1 ? spacingMeters / 2 : 0;
+          // Convert the meter offset into degrees right away
+          const offset = indexM % 2 === 1 ? (spacingMeters / 2) / lonDegreeMeters : 0;
           for (let indexE = 0; indexE < countE; indexE++) {
             const deltaNorth = indexM * spacingMeters;
             const deltaEast = indexE * spacingMeters;

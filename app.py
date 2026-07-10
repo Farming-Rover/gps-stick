@@ -46,7 +46,8 @@ def generate_grid(origin_lat, origin_lon, rows, cols, spacing_meters):
     for r in range(rows):
         offset = 0
         if r % 2 == 1:
-            offset = spacing_meters / 2
+            # Convert the meter offset into degrees
+            offset = (spacing_meters / 2) / lon_degree_meters
         for c in range(cols):
             dn = r * spacing_meters
             de = c * spacing_meters
