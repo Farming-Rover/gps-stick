@@ -1100,6 +1100,12 @@ with st.sidebar:
         )
 
         if st.button("Reset grid to current position", use_container_width=True):
+            # Fragment args are frozen at the last full-page run; read the
+            # freshest fix (kept up to date by the GPS polling fragments).
+            latest_msg = st.session_state.get("last_gps_msg")
+            if latest_msg is not None:
+                current_lat = float(latest_msg.latitude)
+                current_lon = float(latest_msg.longitude)
             reset_grid_to_current_position(
                 current_lat, current_lon, grid_lines_m, grid_lines_e, spacing
             )

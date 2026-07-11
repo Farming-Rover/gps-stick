@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -398,7 +399,13 @@ def _encode_payload(payload: dict) -> str:
 
 def post_map_message(payload: dict) -> None:
     """Send a lightweight update to the mounted map iframe without remounting it."""
-    message_b64 = _encode_payload({"type": MAP_MESSAGE_TYPE, **payload})
+    # The nonce makes each messenger render unique. Without it, Streamlit sees
+    # identical iframe HTML on repeated sends (e.g. pressing the same button
+    # twice), skips remounting it, and the message never fires. The map-side
+    # handlers ignore the extra key.
+    message_b64 = _encode_payload(
+        {"type": MAP_MESSAGE_TYPE, "_nonce": time.time_ns(), **payload}
+    )
     channel_name = json.dumps(MAP_MESSAGE_TYPE)
     render_html_embed(
         f"""
