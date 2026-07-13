@@ -1689,7 +1689,10 @@ else:
             if st.button("Save Grid Location", use_container_width=True):
                 if saved_grid_exists(save_name) and pending_overwrite != safe_name:
                     st.session_state.grid_overwrite_confirm = safe_name
-                    st.rerun()
+                    # Fragment-only: a full app remount would clear the live
+                    # map iframe while live_map_mounted stayed True, so the
+                    # map would never be re-rendered and would "disappear".
+                    st.rerun(scope="fragment")
                 st.session_state.pop("grid_overwrite_confirm", None)
                 saved_file, orientation = save_grid_to_file(save_name)
                 # Persist across the app-scoped rerun so the success toast and
