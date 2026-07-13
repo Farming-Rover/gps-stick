@@ -1,11 +1,76 @@
 import base64
 import json
 import time
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 MAP_MESSAGE_TYPE = "gps-stick-map"
+
+# The placement map is a real bidirectional custom component (it must report
+# the panned grid origin back to Python). Its frontend lives in
+# placement_map_component/index.html.
+_placement_map_component = components.declare_component(
+    "placement_map",
+    path=str(Path(__file__).parent / "placement_map_component"),
+)
+
+
+def _call_component_json_only(component, *, default=None, key=None, **kwargs):
+    """Invoke a custom component without Streamlit's PyArrow import guard.
+
+    CustomComponent.create_instance refuses to run when PyArrow is missing,
+    but PyArrow is only actually used to marshal dataframe args and unmarshal
+    Arrow-table return values. This component exchanges plain JSON scalars,
+    and the Raspberry Pi Zero (32-bit ARMv6) can't install PyArrow, so this
+    replicates create_instance's JSON-only path (verified against Streamlit
+    1.58.0, which must be the version on the Pi).
+    """
+    from streamlit.delta_generator_singletons import get_dg_singleton_instance
+    from streamlit.elements.lib.form_utils import current_form_id
+    from streamlit.elements.lib.utils import compute_and_register_element_id
+    from streamlit.proto.Element_pb2 import Element
+    from streamlit.runtime.scriptrunner_utils.script_run_context import (
+        get_script_run_ctx,
+    )
+    from streamlit.runtime.state import register_widget
+
+    serialized_json_args = json.dumps(dict(kwargs, default=default, key=key))
+
+    dg = get_dg_singleton_instance().main_dg
+    element = Element()
+    instance = element.component_instance
+    instance.component_name = component.name
+    instance.form_id = current_form_id(dg)
+    if component.url is not None:
+        instance.url = component.url
+    instance.json_args = serialized_json_args
+
+    instance.id = compute_and_register_element_id(
+        "component_instance",
+        user_key=key,
+        key_as_main_identity={"name", "url"},
+        dg=dg,
+        name=component.name,
+        url=component.url,
+        json_args=serialized_json_args,
+        special_args=[],
+    )
+
+    component_state = register_widget(
+        instance.id,
+        deserializer=lambda ui_value: ui_value,
+        serializer=lambda x: x,
+        ctx=get_script_run_ctx(),
+        value_type="json_value",
+    )
+    widget_value = component_state.value
+    if widget_value is None:
+        widget_value = default
+
+    dg._enqueue("component_instance", instance)
+    return widget_value
 
 
 def render_html_embed(html: str, height: int) -> None:
@@ -18,379 +83,6 @@ def render_html_embed(html: str, height: int) -> None:
         st.iframe(html, height=max(int(height), 1))
     else:
         components.html(html, height=height, scrolling=False)
-
-_PLACEMENT_MAP_HTML = """<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-      crossorigin=""
-    />
-    <style>
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-      }
-
-      #map {
-        width: 100%;
-        height: 100%;
-      }
-
-      .map-shell {
-        position: relative;
-        width: 100%;
-        height: 520px;
-      }
-
-      .center-reticle {
-        pointer-events: none;
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        width: 26px;
-        height: 26px;
-        margin-left: -13px;
-        margin-top: -13px;
-        z-index: 1000;
-        border: 2px solid rgba(0, 200, 83, 0.95);
-        border-radius: 50%;
-        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85);
-      }
-
-      .center-reticle::before,
-      .center-reticle::after {
-        content: "";
-        position: absolute;
-        background: rgba(0, 200, 83, 0.95);
-      }
-
-      .center-reticle::before {
-        left: 50%;
-        top: 3px;
-        width: 2px;
-        height: 20px;
-        margin-left: -1px;
-      }
-
-      .center-reticle::after {
-        top: 50%;
-        left: 3px;
-        width: 20px;
-        height: 2px;
-        margin-top: -1px;
-      }
-
-      .map-hud {
-        position: absolute;
-        left: 10px;
-        bottom: 10px;
-        z-index: 1000;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        align-items: flex-start;
-      }
-
-      .origin-readout {
-        background: rgba(255, 255, 255, 0.92);
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        border-radius: 6px;
-        padding: 6px 10px;
-        font: 12px/1.4 sans-serif;
-        color: #222;
-        pointer-events: none;
-      }
-
-      .apply-origin-btn {
-        border: none;
-        border-radius: 6px;
-        padding: 8px 12px;
-        font: 13px/1.2 sans-serif;
-        font-weight: 600;
-        color: #fff;
-        background: #1565c0;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
-        cursor: pointer;
-      }
-
-      .apply-origin-btn:hover {
-        background: #0d47a1;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="map-shell">
-      <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
-      <div id="map"></div>
-      <div class="center-reticle" title="Grid origin (R1C1)"></div>
-      <div class="map-hud">
-        <div id="origin-readout" class="origin-readout"></div>
-      </div>
-    </div>
-
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-      crossorigin=""
-    ></script>
-    <script>
-      const MAP_MESSAGE_TYPE = __MAP_MESSAGE_TYPE__;
-      const MAP_CONFIG = JSON.parse(
-        atob(document.getElementById("map-config").dataset.configB64)
-      );
-
-      let suppressEvents = false;
-
-      function asCount(value, fallback) {
-        const parsed = Math.round(Number(value));
-        if (!Number.isFinite(parsed) || parsed < 1) {
-          return fallback;
-        }
-        return parsed;
-      }
-
-      function generateGrid(originLat, originLon, lineCountM, lineCountE, spacing) {
-        const countM = asCount(lineCountM, 4);
-        const countE = asCount(lineCountE, 4);
-        const spacingMeters = Number(spacing);
-        const latDegreeMeters = 111132.92;
-        const lonDegreeMeters =
-          (40075000 * Math.cos((originLat * Math.PI) / 180)) / 360;
-        const points = [];
-
-        for (let indexM = 0; indexM < countM; indexM++) {
-          // Convert the meter offset into degrees right away
-          const offset = indexM % 2 === 1 ? (spacingMeters / 2) / lonDegreeMeters : 0;
-          for (let indexE = 0; indexE < countE; indexE++) {
-            const deltaNorth = indexM * spacingMeters;
-            const deltaEast = indexE * spacingMeters;
-            points.push({
-              label: `R${indexM + 1}C${indexE + 1}`,
-              lat: originLat + deltaNorth / latDegreeMeters,
-              lon: originLon + deltaEast / lonDegreeMeters + offset,
-              isOrigin: indexM === 0 && indexE === 0,
-            });
-          }
-        }
-
-        return points;
-      }
-
-      function updateOriginReadout(lat, lng, zoom) {
-        const readout = document.getElementById("origin-readout");
-        readout.textContent =
-          `${asCount(MAP_CONFIG.dim_m, 4)}x${asCount(MAP_CONFIG.dim_e, 4)} grid`;
-      }
-
-      function drawGrid(originLat, originLon) {
-        gridLayer.clearLayers();
-
-        const points = generateGrid(
-          originLat,
-          originLon,
-          MAP_CONFIG.dim_m,
-          MAP_CONFIG.dim_e,
-          MAP_CONFIG.spacing_m
-        );
-
-        points.forEach((point) => {
-          L.circleMarker([point.lat, point.lon], {
-            radius: point.isOrigin ? 9 : 6,
-            color: point.isOrigin ? "#00C853" : "#1E90FF",
-            fillColor: point.isOrigin ? "#00C853" : "#1E90FF",
-            fillOpacity: point.isOrigin ? 0.85 : 0.45,
-            weight: 2,
-          })
-            .bindPopup(point.label)
-            .addTo(gridLayer);
-        });
-      }
-
-      function drawUserMarker() {
-        userMarker.clearLayers();
-        L.circleMarker([MAP_CONFIG.user_lat, MAP_CONFIG.user_lon], {
-          radius: 7,
-          color: "#FF0000",
-          fillColor: "#FF0000",
-          fillOpacity: 1.0,
-          weight: 2,
-        })
-          .bindPopup("Your position")
-          .addTo(userMarker);
-        }
-
-      function pushViewportToStreamlit() {
-        const center = map.getCenter();
-        const baseUrl = window.location.origin + window.location.pathname;
-        const nextUrl = "/?origin_lat=" + center.lat.toFixed(8) + "&origin_lon=" + center.lng.toFixed(8) + "&map_zoom=" + String(map.getZoom());
-        try {
-          window.top.location.href = nextUrl;
-        } catch (e) {
-          window.parent.location.href = nextUrl;
-        }
-      }
-
-      function onViewportChanged() {
-        if (suppressEvents) {
-          return;
-        }
-        const center = map.getCenter();
-        drawGrid(center.lat, center.lng);
-        updateOriginReadout(center.lat, center.lng, map.getZoom());
-      }
-
-      function applyView(centerLat, centerLon, zoom) {
-        suppressEvents = true;
-        map.setView([centerLat, centerLon], zoom, { animate: false });
-        suppressEvents = false;
-        drawGrid(centerLat, centerLon);
-        updateOriginReadout(centerLat, centerLon, zoom);
-      }
-
-      function applyUpdateGrid(data) {
-        const prevM = MAP_CONFIG.dim_m;
-        const prevE = MAP_CONFIG.dim_e;
-        const prevSpacing = MAP_CONFIG.spacing_m;
-
-        if (data.dim_m != null) MAP_CONFIG.dim_m = asCount(data.dim_m, 4);
-        if (data.dim_e != null) MAP_CONFIG.dim_e = asCount(data.dim_e, 4);
-        if (data.spacing_m != null) MAP_CONFIG.spacing_m = Number(data.spacing_m);
-
-        // Duplicate messages arrive from the sender's retries; skip no-op redraws.
-        if (
-          prevM === MAP_CONFIG.dim_m &&
-          prevE === MAP_CONFIG.dim_e &&
-          prevSpacing === MAP_CONFIG.spacing_m
-        ) {
-          return;
-        }
-
-        const center = map.getCenter();
-        drawGrid(center.lat, center.lng);
-        updateOriginReadout(center.lat, center.lng, map.getZoom());
-      }
-
-      function handleMapMessage(data) {
-        if (!data || data.type !== MAP_MESSAGE_TYPE || !map) {
-          return;
-        }
-
-        if (data.action === "updateGrid") {
-          applyUpdateGrid(data);
-          return;
-        }
-
-        if (data.action === "updateView") {
-          if (data.center_lat != null) {
-            MAP_CONFIG.center_lat = data.center_lat;
-          }
-          if (data.center_lon != null) {
-            MAP_CONFIG.center_lon = data.center_lon;
-          }
-          if (data.zoom != null) {
-            MAP_CONFIG.zoom = data.zoom;
-          }
-          applyView(
-            MAP_CONFIG.center_lat,
-            MAP_CONFIG.center_lon,
-            MAP_CONFIG.zoom
-          );
-          return;
-        }
-
-        if (data.action === "updateUser") {
-          const nextLat = Number(data.user_lat);
-          const nextLon = Number(data.user_lon);
-          if (
-            !Number.isFinite(nextLat) ||
-            !Number.isFinite(nextLon) ||
-            (nextLat === MAP_CONFIG.user_lat && nextLon === MAP_CONFIG.user_lon)
-          ) {
-            return;
-          }
-          MAP_CONFIG.user_lat = nextLat;
-          MAP_CONFIG.user_lon = nextLon;
-          drawUserMarker();
-        }
-      }
-
-      const map = L.map("map", {
-        center: [MAP_CONFIG.center_lat, MAP_CONFIG.center_lon],
-        zoom: MAP_CONFIG.zoom,
-        zoomControl: true,
-        maxZoom: 25,
-      });
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "&copy; OpenStreetMap contributors",
-        maxZoom: 25,
-        maxNativeZoom: 19,
-      }).addTo(map);
-
-      L.control
-        .scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 120 })
-        .addTo(map);
-
-      const gridLayer = L.layerGroup().addTo(map);
-      const userMarker = L.layerGroup().addTo(map);
-
-      map.on("move", onViewportChanged);
-      map.on("zoom", onViewportChanged);
-
-      drawGrid(MAP_CONFIG.center_lat, MAP_CONFIG.center_lon);
-      drawUserMarker();
-      updateOriginReadout(
-        MAP_CONFIG.center_lat,
-        MAP_CONFIG.center_lon,
-        MAP_CONFIG.zoom
-      );
-
-      const applyOriginBtn = document.getElementById("apply-origin");
-      if (applyOriginBtn) {
-        applyOriginBtn.addEventListener("click", pushViewportToStreamlit);
-      }
-
-      try {
-        if (typeof BroadcastChannel !== "undefined") {
-          const gridChannel = new BroadcastChannel(MAP_MESSAGE_TYPE);
-          gridChannel.onmessage = (event) => {
-            handleMapMessage(event.data);
-          };
-        }
-      } catch (error) {
-        // Ignore channel errors on older browsers.
-      }
-
-      try {
-        if (window.parent.__gpsStickMapHandler) {
-          window.parent.removeEventListener(
-            "message",
-            window.parent.__gpsStickMapHandler
-          );
-        }
-        window.parent.__gpsStickMapHandler = (event) => {
-          handleMapMessage(event.data);
-        };
-        window.parent.addEventListener(
-          "message",
-          window.parent.__gpsStickMapHandler
-        );
-      } catch (error) {
-        // Ignore parent listener errors in restricted iframes.
-      }
-    </script>
-  </body>
-</html>
-"""
 
 
 def _encode_payload(payload: dict) -> str:
@@ -448,19 +140,27 @@ def render_placement_map(
     user_lat,
     user_lon,
     height=520,
+    view_seq=0,
 ):
-    config = {
-        "center_lat": center_lat,
-        "center_lon": center_lon,
-        "zoom": zoom,
-        "dim_m": int(line_count_m),
-        "dim_e": int(line_count_e),
-        "spacing_m": float(spacing),
-        "user_lat": user_lat,
-        "user_lon": user_lon,
-    }
-    html = (
-        _PLACEMENT_MAP_HTML.replace("__MAP_CONFIG_B64__", _encode_payload(config))
-        .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
+    """Render the grid placement map and return the current grid origin.
+
+    Returns None until the user pans/zooms, then dicts like
+    {"lat": ..., "lon": ..., "zoom": ..., "seq": ...}. The map only snaps its
+    view to (center_lat, center_lon) when view_seq changes; otherwise reruns
+    leave the user's current pan/zoom untouched.
+    """
+    return _call_component_json_only(
+        _placement_map_component,
+        center_lat=float(center_lat),
+        center_lon=float(center_lon),
+        zoom=int(zoom),
+        dim_m=int(line_count_m),
+        dim_e=int(line_count_e),
+        spacing_m=float(spacing),
+        user_lat=float(user_lat),
+        user_lon=float(user_lon),
+        height=int(height),
+        view_seq=int(view_seq),
+        key="placement_map",
+        default=None,
     )
-    render_html_embed(html, height=height)

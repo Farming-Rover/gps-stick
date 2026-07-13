@@ -1,7 +1,9 @@
 import base64
 import json
 import math
+import re
 import time
+from pathlib import Path
 
 import pandas as pd
 import pynmea2
@@ -19,7 +21,7 @@ SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 
 # Base Station Configuration
-BASE_IP = "192.168.1.62"
+BASE_IP = "192.168.1.100"
 BASE_PORT = "2101"
 
 # st.map size values are in meters (not pixels)
@@ -65,35 +67,6 @@ def generate_grid(origin_lat, origin_lon, rows, cols, spacing_meters):
                 "size": GRID_MARKER_SIZE_M,
             })
     return pd.DataFrame(grid)
-
-def sync_placement_from_query_params():
-    """Apply map pan/zoom updates sent via URL query params (no PyArrow needed)."""
-    qp = st.query_params
-    if "origin_lat" not in qp or "origin_lon" not in qp:
-        return False
-
-    new_lat = float(qp["origin_lat"])
-    new_lon = float(qp["origin_lon"])
-    new_zoom = int(qp.get("map_zoom", st.session_state.map_zoom))
-
-    origin_moved = (
-        abs(new_lat - st.session_state.preview_origin_lat) > 1e-8
-        or abs(new_lon - st.session_state.preview_origin_lon) > 1e-8
-    )
-    zoom_changed = new_zoom != st.session_state.map_zoom
-
-    if origin_moved or zoom_changed:
-        st.session_state.preview_origin_lat = new_lat
-        st.session_state.preview_origin_lon = new_lon
-        st.session_state.map_view_center = [new_lat, new_lon]
-        st.session_state.map_zoom = new_zoom
-
-    del st.query_params["origin_lat"]
-    del st.query_params["origin_lon"]
-    if "map_zoom" in qp:
-        del st.query_params["map_zoom"]
-
-    return origin_moved or zoom_changed
 
 _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -995,7 +968,7 @@ def _ensure_gps_serial():
     except Exception:
         st.session_state.gps_serial = None
 
-def poll_gps(block_until_fix=False, timeout_s=5.0):
+def poll_gps(timeout_s=2.0):
     """Read buffered serial data and return the latest valid GGA fix."""
     _ensure_gps_serial()
     ser = st.session_state.get("gps_serial")
@@ -1004,7 +977,7 @@ def poll_gps(block_until_fix=False, timeout_s=5.0):
 
     # Non-blocking polls get a hard time budget so serial reads can't stall
     # the Streamlit session (fragments in a session run one at a time).
-    deadline = time.time() + (timeout_s if block_until_fix else 0.15)
+    deadline = time.time() + timeout_s
 
     while True:
         try:
@@ -1018,21 +991,11 @@ def poll_gps(block_until_fix=False, timeout_s=5.0):
                 if msg is not None:
                     st.session_state.last_gps_msg = msg
 
-        if block_until_fix:
-            if st.session_state.last_gps_msg is not None:
-                break
-            if time.time() >= deadline:
-                break
-            continue
-
+        if st.session_state.last_gps_msg is not None:
+            break
         if time.time() >= deadline:
             break
-
-        try:
-            if not line or ser.in_waiting == 0:
-                break
-        except Exception:
-            break
+        continue
 
     return st.session_state.last_gps_msg
 
@@ -1045,17 +1008,17 @@ def init_placement_state(current_lat, current_lon):
         st.session_state.preview_origin_lat = current_lat
     if "preview_origin_lon" not in st.session_state:
         st.session_state.preview_origin_lon = current_lon
-    if "map_view_center" not in st.session_state:
-        st.session_state.map_view_center = [current_lat, current_lon]
     if "map_zoom" not in st.session_state:
         st.session_state.map_zoom = 19
-    if "placement_map_mounted" not in st.session_state:
-        st.session_state.placement_map_mounted = False
+    # Bumped whenever Python wants to force the placement map's view to the
+    # preview origin (instead of leaving the user's pan/zoom alone).
+    if "placement_view_seq" not in st.session_state:
+        st.session_state.placement_view_seq = 0
 
 def reset_grid_to_current_position(current_lat, current_lon, line_count_m, line_count_e, spacing):
     st.session_state.preview_origin_lat = current_lat
     st.session_state.preview_origin_lon = current_lon
-    st.session_state.map_view_center = [current_lat, current_lon]
+    st.session_state.placement_view_seq += 1
     if st.session_state.grid_finalized:
         st.session_state.grid_df = generate_grid(
             current_lat, current_lon, line_count_m, line_count_e, spacing
@@ -1071,21 +1034,108 @@ def finalize_grid_location(line_count_m, line_count_e, spacing):
     )
     st.session_state.grid_finalized = True
 
+# --- GRID SAVE / LOAD ---
+GRID_SAVE_DIR = Path(__file__).parent / "saved_grids"
+
+def grid_save_safe_name(name):
+    """Sanitize a user-facing grid name into a filesystem-safe stem."""
+    safe_name = re.sub(r"[^\w-]+", "_", (name or "").strip()).strip("_")
+    if not safe_name:
+        safe_name = time.strftime("grid_%Y%m%d_%H%M%S")
+    return safe_name
+
+def save_grid_to_file(name):
+    """Save the finalized grid's origin and parameters as JSON. Returns filename."""
+    GRID_SAVE_DIR.mkdir(exist_ok=True)
+    safe_name = grid_save_safe_name(name)
+    payload = {
+        "origin_lat": float(st.session_state.preview_origin_lat),
+        "origin_lon": float(st.session_state.preview_origin_lon),
+        "rows": int(st.session_state.grid_dim_m),
+        "cols": int(st.session_state.grid_dim_e),
+        "spacing_m": float(st.session_state.grid_spacing),
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    file_path = GRID_SAVE_DIR / f"{safe_name}.json"
+    file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return file_path.name
+
+def list_saved_grids():
+    if not GRID_SAVE_DIR.is_dir():
+        return []
+    return sorted(GRID_SAVE_DIR.glob("*.json"))
+
+def saved_grid_exists(name):
+    return (GRID_SAVE_DIR / f"{grid_save_safe_name(name)}.json").is_file()
+
+def apply_pending_grid_load():
+    """Apply a grid load staged by the sidebar's Load button.
+
+    Widget values (rows/cols/spacing) can only be written to session state
+    before their widgets are instantiated, so the Load button stages the data
+    and reruns; this applies it at the top of the next full run.
+    """
+    data = st.session_state.pop("pending_grid_load", None)
+    if data is None:
+        return
+    try:
+        origin_lat = float(data["origin_lat"])
+        origin_lon = float(data["origin_lon"])
+        rows = max(1, int(data["rows"]))
+        cols = max(1, int(data["cols"]))
+        spacing = max(0.5, float(data["spacing_m"]))
+    except (KeyError, TypeError, ValueError):
+        st.error("That saved grid file is invalid and can't be loaded.")
+        return
+    st.session_state.grid_dim_m = rows
+    st.session_state.grid_dim_e = cols
+    st.session_state.grid_spacing = spacing
+    st.session_state.preview_origin_lat = origin_lat
+    st.session_state.preview_origin_lon = origin_lon
+    # Open the placement view snapped to the loaded origin so the user can
+    # confirm (or tweak) before pressing "Finalize grid location".
+    st.session_state.grid_finalized = False
+    st.session_state.placement_view_seq += 1
+    st.session_state.live_map_mounted = False
+    st.session_state.live_nav_panel_mounted = False
+
+def apply_pending_saved_grid_choice():
+    """Select a newly saved grid in the sidebar before its selectbox mounts."""
+    choice = st.session_state.pop("pending_saved_grid_choice", None)
+    if choice is not None:
+        st.session_state.saved_grid_choice = choice
+
 # --- STREAMLIT UI LAYOUT ---
 st.set_page_config(page_title="RTK Live Map Guide", layout="wide")
 st.title("RTK Live Map Guide")
 
-if st.session_state.get("last_gps_msg") is None:
-    msg = poll_gps(block_until_fix=True, timeout_s=10)
-else:
-    msg = poll_gps()
+# Streamlit fades elements to 33% opacity while a rerun is in flight
+# ("stale" elements). Every map pan triggers a rerun, so without this the
+# placement map grays out on each drag and feels broken.
+st.markdown(
+    """
+    <style>
+    [data-testid="stElementContainer"][data-stale="true"]:has(iframe.stCustomComponentV1) {
+        opacity: 1 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-if msg is None:
-    st.warning("Waiting for GPS fix from the receiver...")
-    st.stop()
+msg = poll_gps()
+
+secs = 0
+while msg is None:
+    st.warning(f"Waiting for GPS fix from the receiver ({secs}s)...")
+    msg = poll_gps(timeout_s=1)
+    secs += 1
+
 
 current_lat, current_lon = float(msg.latitude), float(msg.longitude)
 init_placement_state(current_lat, current_lon)
+apply_pending_grid_load()
+apply_pending_saved_grid_choice()
 
 
 with st.sidebar:
@@ -1109,12 +1159,14 @@ with st.sidebar:
             reset_grid_to_current_position(
                 current_lat, current_lon, grid_lines_m, grid_lines_e, spacing
             )
-            post_map_message({
-                "action": "updateView",
-                "center_lat": current_lat,
-                "center_lon": current_lon,
-                "zoom": st.session_state.map_zoom,
-            })
+            # reset_grid_to_current_position bumped placement_view_seq, which
+            # makes the placement map snap to the new origin on the next full
+            # run. The live map doesn't handle view/grid messages, so remount
+            # it instead. The button sits in a fragment, so the rerun must be
+            # app-scoped to reach the maps in the main body.
+            st.session_state.live_map_mounted = False
+            st.session_state.live_nav_panel_mounted = False
+            st.rerun(scope="app")
 
         grid_config = (int(grid_lines_m), int(grid_lines_e), float(spacing))
         if st.session_state.get("last_grid_config_sent") != grid_config:
@@ -1126,11 +1178,34 @@ with st.sidebar:
                 "spacing_m": grid_config[2],
             })
 
+        st.divider()
+        saved_grids = list_saved_grids()
+        if saved_grids:
+            chosen_grid = st.selectbox(
+                "Saved grids",
+                [f.stem for f in saved_grids],
+                key="saved_grid_choice",
+            )
+            if st.button("Load grid", use_container_width=True):
+                try:
+                    grid_data = json.loads(
+                        (GRID_SAVE_DIR / f"{chosen_grid}.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                except (OSError, json.JSONDecodeError):
+                    st.error("Could not read that grid file.")
+                else:
+                    # Widgets are already instantiated this run; stage the
+                    # load and apply it at the top of the next full run.
+                    st.session_state.pending_grid_load = grid_data
+                    st.rerun(scope="app")
+        else:
+            st.caption("No saved grids yet.")
+
     render_grid_settings(current_lat, current_lon)
 
 if not st.session_state.grid_finalized:
-    sync_placement_from_query_params()
-
     st.subheader("Position Your Grid")
     st.caption(
         "Pan and zoom the map to slide the terrain under the preview grid. "
@@ -1138,24 +1213,38 @@ if not st.session_state.grid_finalized:
         "Click **Finalize grid location** to confirm the grid position."
     )
 
-    if not st.session_state.placement_map_mounted:
-        render_placement_map(
+    # The map lives in a fragment so each pan-end (which reports the new
+    # origin as a component value) reruns only this block, not the whole
+    # script. That keeps reruns fast on the Pi and the UI steady.
+    @st.fragment
+    def placement_map_fragment(user_lat, user_lon):
+        map_state = render_placement_map(
             center_lat=st.session_state.preview_origin_lat,
             center_lon=st.session_state.preview_origin_lon,
             zoom=st.session_state.map_zoom,
             line_count_m=int(st.session_state.get("grid_dim_m", 4)),
             line_count_e=int(st.session_state.get("grid_dim_e", 4)),
             spacing=float(st.session_state.get("grid_spacing", 2.0)),
-            user_lat=current_lat,
-            user_lon=current_lon,
+            user_lat=user_lat,
+            user_lon=user_lon,
             height=520,
+            view_seq=st.session_state.placement_view_seq,
         )
-        st.session_state.placement_map_mounted = True
+        # The component reports the map center after every pan/zoom. Ignore
+        # values tagged with an old view_seq: they predate a "Reset grid to
+        # current position" snap and would override it.
+        if (
+            map_state is not None
+            and map_state.get("seq") == st.session_state.placement_view_seq
+        ):
+            st.session_state.preview_origin_lat = float(map_state["lat"])
+            st.session_state.preview_origin_lon = float(map_state["lon"])
+            st.session_state.map_zoom = int(map_state["zoom"])
+
+    placement_map_fragment(current_lat, current_lon)
 
     @st.fragment(run_every=1.0)
     def refresh_placement_user_marker():
-        if not st.session_state.placement_map_mounted:
-            return
         msg = poll_gps()
         if msg is None:
             return
@@ -1177,7 +1266,6 @@ if not st.session_state.grid_finalized:
                 int(st.session_state.grid_dim_e),
                 float(st.session_state.grid_spacing),
             )
-            st.session_state.placement_map_mounted = False
             st.session_state.live_map_mounted = False
             st.session_state.live_nav_panel_mounted = False
             st.rerun()
@@ -1185,12 +1273,53 @@ if not st.session_state.grid_finalized:
 else:
     df = st.session_state.grid_df
 
-    if st.button("Adjust grid placement"):
-        st.session_state.grid_finalized = False
-        st.session_state.placement_map_mounted = False
-        st.session_state.live_map_mounted = False
-        st.session_state.live_nav_panel_mounted = False
-        st.rerun()
+    col_adjust, col_save = st.columns(2)
+    with col_adjust:
+        if st.button("Adjust grid placement", use_container_width=True):
+            st.session_state.grid_finalized = False
+            # Snap the placement map back to the finalized origin when it remounts.
+            st.session_state.placement_view_seq += 1
+            st.session_state.live_map_mounted = False
+            st.session_state.live_nav_panel_mounted = False
+            st.rerun()
+    with col_save:
+        # Keep name entry / overwrite warnings in a fragment so typing a name
+        # doesn't full-rerun the page and strip the already-mounted live map.
+        @st.fragment
+        def render_grid_save_controls():
+            save_name = st.text_input(
+                "Grid name",
+                value=time.strftime("grid_%Y%m%d_%H%M%S"),
+                key="grid_save_name",
+                label_visibility="collapsed",
+                placeholder="Grid name",
+            )
+            st.caption(
+                "Saving with a name that already exists will overwrite that grid."
+            )
+            if saved_grid_exists(save_name):
+                st.warning(
+                    f'A grid named "{grid_save_safe_name(save_name)}" already exists '
+                    "and will be overwritten if you save."
+                )
+            if st.button("Save Grid Location", use_container_width=True):
+                saved_file = save_grid_to_file(save_name)
+                # Persist across the app-scoped rerun so the success toast and
+                # the sidebar "Saved grids" list both refresh; remount the live
+                # map because a full rerun would otherwise skip it.
+                st.session_state.grid_save_flash = (
+                    f"Grid saved to saved_grids/{saved_file}"
+                )
+                st.session_state.pending_saved_grid_choice = Path(saved_file).stem
+                st.session_state.live_map_mounted = False
+                st.session_state.live_nav_panel_mounted = False
+                st.rerun(scope="app")
+
+        render_grid_save_controls()
+
+    flash = st.session_state.pop("grid_save_flash", None)
+    if flash:
+        st.success(flash)
 
     grid_points = [
         {"point": row["Point"], "lat": row["lat"], "lon": row["lon"]}

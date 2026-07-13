@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      #map {
+        width: 100%;
+        height: 100%;
+      }
+
+      .map-shell {
+        position: relative;
+        width: 100%;
+        height: 520px;
+      }
+
+      .center-reticle {
+        pointer-events: none;
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 26px;
+        height: 26px;
+        margin-left: -13px;
+        margin-top: -13px;
+        z-index: 1000;
+        border: 2px solid rgba(0, 200, 83, 0.95);
+        border-radius: 50%;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85);
+      }
+
+      .center-reticle::before,
+      .center-reticle::after {
+        content: "";
+        position: absolute;
+        background: rgba(0, 200, 83, 0.95);
+      }
+
+      .center-reticle::before {
+        left: 50%;
+        top: 3px;
+        width: 2px;
+        height: 20px;
+        margin-left: -1px;
+      }
+
+      .center-reticle::after {
+        top: 50%;
+        left: 3px;
+        width: 20px;
+        height: 2px;
+        margin-top: -1px;
+      }
+
+      .map-hud {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-start;
+      }
+
+      .origin-readout {
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 6px;
+        padding: 6px 10px;
+        font: 12px/1.4 sans-serif;
+        color: #222;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="map-shell" id="map-shell">
+      <div id="map"></div>
+      <div class="center-reticle" title="Grid origin (R1C1)"></div>
+      <div class="map-hud">
+        <div id="origin-readout" class="origin-readout"></div>
+      </div>
+    </div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script>
+      // Must match MAP_MESSAGE_TYPE in placement_map_html.py.
+      const MAP_MESSAGE_TYPE = "gps-stick-map";
+
+      // --- Streamlit custom component protocol (manual, no build step) ---
+      function sendToStreamlit(type, data) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type: type }, data),
+          "*"
+        );
+      }
+
+      let map = null;
+      let gridLayer = null;
+      let userMarker = null;
+      let suppressEvents = false;
+      // Python bumps view_seq when it wants to force the view to the args
+      // center (e.g. "Reset grid to current position"). Values reported back
+      // carry the seq so stale positions can be ignored server-side.
+      let lastViewSeq = null;
+
+      const CONFIG = {
+        dim_m: 4,
+        dim_e: 4,
+        spacing_m: 2.0,
+        user_lat: null,
+        user_lon: null,
+      };
+
+      function asCount(value, fallback) {
+        const parsed = Math.round(Number(value));
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          return fallback;
+        }
+        return parsed;
+      }
+
+      function generateGrid(originLat, originLon) {
+        const countM = CONFIG.dim_m;
+        const countE = CONFIG.dim_e;
+        const spacingMeters = Number(CONFIG.spacing_m);
+        const latDegreeMeters = 111132.92;
+        const lonDegreeMeters =
+          (40075000 * Math.cos((originLat * Math.PI) / 180)) / 360;
+        const points = [];
+
+        for (let indexM = 0; indexM < countM; indexM++) {
+          // Convert the meter offset into degrees right away
+          const offset =
+            indexM % 2 === 1 ? (spacingMeters / 2) / lonDegreeMeters : 0;
+          for (let indexE = 0; indexE < countE; indexE++) {
+            const deltaNorth = indexM * spacingMeters;
+            const deltaEast = indexE * spacingMeters;
+            points.push({
+              label: `R${indexM + 1}C${indexE + 1}`,
+              lat: originLat + deltaNorth / latDegreeMeters,
+              lon: originLon + deltaEast / lonDegreeMeters + offset,
+              isOrigin: indexM === 0 && indexE === 0,
+            });
+          }
+        }
+
+        return points;
+      }
+
+      function updateOriginReadout() {
+        const readout = document.getElementById("origin-readout");
+        readout.textContent = `${CONFIG.dim_m}x${CONFIG.dim_e} grid`;
+      }
+
+      function drawGrid(originLat, originLon) {
+        gridLayer.clearLayers();
+        generateGrid(originLat, originLon).forEach((point) => {
+          L.circleMarker([point.lat, point.lon], {
+            radius: point.isOrigin ? 9 : 6,
+            color: point.isOrigin ? "#00C853" : "#1E90FF",
+            fillColor: point.isOrigin ? "#00C853" : "#1E90FF",
+            fillOpacity: point.isOrigin ? 0.85 : 0.45,
+            weight: 2,
+          })
+            .bindPopup(point.label)
+            .addTo(gridLayer);
+        });
+      }
+
+      function drawUserMarker() {
+        userMarker.clearLayers();
+        if (
+          !Number.isFinite(CONFIG.user_lat) ||
+          !Number.isFinite(CONFIG.user_lon)
+        ) {
+          return;
+        }
+        L.circleMarker([CONFIG.user_lat, CONFIG.user_lon], {
+          radius: 7,
+          color: "#FF0000",
+          fillColor: "#FF0000",
+          fillOpacity: 1.0,
+          weight: 2,
+        })
+          .bindPopup("Your position")
+          .addTo(userMarker);
+      }
+
+      function onViewportChanged() {
+        if (suppressEvents) {
+          return;
+        }
+        const center = map.getCenter();
+        drawGrid(center.lat, center.lng);
+        updateOriginReadout();
+      }
+
+      function applyView(centerLat, centerLon, zoom) {
+        if (!Number.isFinite(centerLat) || !Number.isFinite(centerLon)) {
+          return;
+        }
+        suppressEvents = true;
+        map.setView(
+          [centerLat, centerLon],
+          Number.isFinite(zoom) ? zoom : map.getZoom(),
+          { animate: false }
+        );
+        suppressEvents = false;
+        drawGrid(centerLat, centerLon);
+        updateOriginReadout();
+      }
+
+      function pushViewportToStreamlit() {
+        if (suppressEvents || !map) {
+          return;
+        }
+        const center = map.getCenter();
+        sendToStreamlit("streamlit:setComponentValue", {
+          dataType: "json",
+          value: {
+            lat: center.lat,
+            lon: center.lng,
+            zoom: map.getZoom(),
+            seq: lastViewSeq,
+          },
+        });
+      }
+
+      function applyUpdateGrid(data) {
+        const prevM = CONFIG.dim_m;
+        const prevE = CONFIG.dim_e;
+        const prevSpacing = CONFIG.spacing_m;
+
+        if (data.dim_m != null) CONFIG.dim_m = asCount(data.dim_m, 4);
+        if (data.dim_e != null) CONFIG.dim_e = asCount(data.dim_e, 4);
+        if (data.spacing_m != null) CONFIG.spacing_m = Number(data.spacing_m);
+
+        // Duplicate messages arrive from the sender's retries; skip no-op redraws.
+        if (
+          prevM === CONFIG.dim_m &&
+          prevE === CONFIG.dim_e &&
+          prevSpacing === CONFIG.spacing_m
+        ) {
+          return;
+        }
+
+        const center = map.getCenter();
+        drawGrid(center.lat, center.lng);
+        updateOriginReadout();
+      }
+
+      function handleMapMessage(data) {
+        if (!data || data.type !== MAP_MESSAGE_TYPE || !map) {
+          return;
+        }
+
+        if (data.action === "updateGrid") {
+          applyUpdateGrid(data);
+          return;
+        }
+
+        if (data.action === "updateUser") {
+          const nextLat = Number(data.user_lat);
+          const nextLon = Number(data.user_lon);
+          if (
+            !Number.isFinite(nextLat) ||
+            !Number.isFinite(nextLon) ||
+            (nextLat === CONFIG.user_lat && nextLon === CONFIG.user_lon)
+          ) {
+            return;
+          }
+          CONFIG.user_lat = nextLat;
+          CONFIG.user_lon = nextLon;
+          drawUserMarker();
+        }
+      }
+
+      function initMap(args) {
+        map = L.map("map", {
+          center: [Number(args.center_lat), Number(args.center_lon)],
+          zoom: Number(args.zoom) || 19,
+          zoomControl: true,
+          maxZoom: 25,
+        });
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: "&copy; OpenStreetMap contributors",
+          maxZoom: 25,
+          maxNativeZoom: 19,
+        }).addTo(map);
+
+        L.control
+          .scale({
+            position: "bottomright",
+            metric: true,
+            imperial: false,
+            maxWidth: 120,
+          })
+          .addTo(map);
+
+        gridLayer = L.layerGroup().addTo(map);
+        userMarker = L.layerGroup().addTo(map);
+
+        map.on("move", onViewportChanged);
+        map.on("zoom", onViewportChanged);
+        map.on("moveend", pushViewportToStreamlit);
+        map.on("zoomend", pushViewportToStreamlit);
+
+        // The iframe is sized by Streamlit after the first render message,
+        // so re-measure once the height settles to avoid a broken tile grid.
+        setTimeout(() => map.invalidateSize(), 100);
+      }
+
+      function handleRender(args) {
+        const height = Number(args.height) || 520;
+        document.getElementById("map-shell").style.height = height + "px";
+        sendToStreamlit("streamlit:setFrameHeight", { height: height });
+
+        CONFIG.dim_m = asCount(args.dim_m, 4);
+        CONFIG.dim_e = asCount(args.dim_e, 4);
+        CONFIG.spacing_m = Number(args.spacing_m) || 2.0;
+        if (args.user_lat != null && args.user_lon != null) {
+          CONFIG.user_lat = Number(args.user_lat);
+          CONFIG.user_lon = Number(args.user_lon);
+        }
+
+        if (map === null) {
+          initMap(args);
+        }
+
+        if (args.view_seq !== lastViewSeq) {
+          lastViewSeq = args.view_seq;
+          applyView(
+            Number(args.center_lat),
+            Number(args.center_lon),
+            Number(args.zoom)
+          );
+        } else {
+          // Ordinary rerun: keep the user's current view, just refresh
+          // the overlays in case grid dimensions changed.
+          const center = map.getCenter();
+          drawGrid(center.lat, center.lng);
+          updateOriginReadout();
+        }
+        drawUserMarker();
+      }
+
+      window.addEventListener("message", (event) => {
+        const data = event.data;
+        if (data && data.type === "streamlit:render") {
+          handleRender(data.args || {});
+        }
+      });
+
+      // Live updates (user GPS marker, grid dims from the sidebar fragment)
+      // arrive over BroadcastChannel between full reruns.
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          const gridChannel = new BroadcastChannel(MAP_MESSAGE_TYPE);
+          gridChannel.onmessage = (event) => {
+            handleMapMessage(event.data);
+          };
+        }
+      } catch (error) {
+        // Ignore channel errors on older browsers.
+      }
+
+      sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+    </script>
+  </body>
+</html>
