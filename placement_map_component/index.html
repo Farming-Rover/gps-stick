@@ -3,12 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-      crossorigin=""
-    />
+    <!-- Served locally by Streamlit from this component's folder: no CDN
+         round trips, so the map initializes as soon as the iframe loads. -->
+    <link rel="stylesheet" href="vendor/leaflet.css" />
     <style>
       html,
       body {
@@ -99,11 +96,8 @@
       </div>
     </div>
 
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-      crossorigin=""
-    ></script>
+    <script src="vendor/leaflet.js"></script>
+    <script src="vendor/leaflet-rotate.js"></script>
     <script>
       // Must match MAP_MESSAGE_TYPE in placement_map_html.py.
       const MAP_MESSAGE_TYPE = "gps-stick-map";
@@ -141,26 +135,75 @@
         return parsed;
       }
 
-      function generateGrid(originLat, originLon) {
+      function destinationLatLng(lat, lon, bearingDeg, distanceM) {
+        if (!distanceM) {
+          return [lat, lon];
+        }
+        const earthRadius = 6371000;
+        const bearing = (bearingDeg * Math.PI) / 180;
+        const lat1 = (lat * Math.PI) / 180;
+        const lon1 = (lon * Math.PI) / 180;
+        const ang = distanceM / earthRadius;
+        const lat2 = Math.asin(
+          Math.sin(lat1) * Math.cos(ang) +
+            Math.cos(lat1) * Math.sin(ang) * Math.cos(bearing)
+        );
+        const lon2 =
+          lon1 +
+          Math.atan2(
+            Math.sin(bearing) * Math.sin(ang) * Math.cos(lat1),
+            Math.cos(ang) - Math.sin(lat1) * Math.sin(lat2)
+          );
+        return [(lat2 * 180) / Math.PI, (lon2 * 180) / Math.PI];
+      }
+
+      function currentBearing() {
+        if (!map || typeof map.getBearing !== "function") {
+          return 0;
+        }
+        const bearing = Number(map.getBearing());
+        return Number.isFinite(bearing) ? ((bearing % 360) + 360) % 360 : 0;
+      }
+
+      // leaflet-rotate's getBearing() is the pane rotation angle. Because of
+      // screen Y-down + its rotation matrix, the geographic direction that
+      // points to the top of the screen is the opposite of that angle.
+      function screenUpBearing() {
+        return (360 - currentBearing()) % 360;
+      }
+
+      function generateGrid(originLat, originLon, rowBearingDeg) {
         const countM = CONFIG.dim_m;
         const countE = CONFIG.dim_e;
         const spacingMeters = Number(CONFIG.spacing_m);
-        const latDegreeMeters = 111132.92;
-        const lonDegreeMeters =
-          (40075000 * Math.cos((originLat * Math.PI) / 180)) / 360;
+        const rowBearing = Number.isFinite(rowBearingDeg)
+          ? ((rowBearingDeg % 360) + 360) % 360
+          : screenUpBearing();
+        const colBearing = (rowBearing + 90) % 360;
         const points = [];
 
+        // Row axis = screen-up; col axis = screen-right. Recompute against
+        // screen-up (not raw getBearing) so the stencil stays fixed on screen
+        // while tiles rotate underneath — using +getBearing over-compensates.
         for (let indexM = 0; indexM < countM; indexM++) {
-          // Convert the meter offset into degrees right away
-          const offset =
-            indexM % 2 === 1 ? (spacingMeters / 2) / lonDegreeMeters : 0;
+          const stagger = indexM % 2 === 1 ? spacingMeters / 2 : 0;
           for (let indexE = 0; indexE < countE; indexE++) {
-            const deltaNorth = indexM * spacingMeters;
-            const deltaEast = indexE * spacingMeters;
+            let [lat, lon] = destinationLatLng(
+              originLat,
+              originLon,
+              rowBearing,
+              indexM * spacingMeters
+            );
+            [lat, lon] = destinationLatLng(
+              lat,
+              lon,
+              colBearing,
+              indexE * spacingMeters + stagger
+            );
             points.push({
               label: `R${indexM + 1}C${indexE + 1}`,
-              lat: originLat + deltaNorth / latDegreeMeters,
-              lon: originLon + deltaEast / lonDegreeMeters + offset,
+              lat,
+              lon,
               isOrigin: indexM === 0 && indexE === 0,
             });
           }
@@ -171,12 +214,28 @@
 
       function updateOriginReadout() {
         const readout = document.getElementById("origin-readout");
-        readout.textContent = `${CONFIG.dim_m}x${CONFIG.dim_e} grid`;
+        const bearing = Math.round(screenUpBearing());
+        readout.textContent = `${CONFIG.dim_m}x${CONFIG.dim_e} grid · ${bearing}°`;
       }
 
+      // Marker pool: moving existing markers with setLatLng is far cheaper
+      // than clearing and recreating the whole layer on every frame of a
+      // drag/rotate gesture. Rebuilt only when the grid dimensions change
+      // (labels and popups depend on row/column layout, not just count).
+      let gridMarkers = [];
+      let gridPoolKey = "";
       function drawGrid(originLat, originLon) {
+        const points = generateGrid(originLat, originLon, screenUpBearing());
+        const poolKey = `${CONFIG.dim_m}x${CONFIG.dim_e}`;
+        if (poolKey === gridPoolKey && gridMarkers.length === points.length) {
+          for (let i = 0; i < points.length; i++) {
+            gridMarkers[i].setLatLng([points[i].lat, points[i].lon]);
+          }
+          return;
+        }
         gridLayer.clearLayers();
-        generateGrid(originLat, originLon).forEach((point) => {
+        gridPoolKey = poolKey;
+        gridMarkers = points.map((point) =>
           L.circleMarker([point.lat, point.lon], {
             radius: point.isOrigin ? 9 : 6,
             color: point.isOrigin ? "#00C853" : "#1E90FF",
@@ -185,8 +244,8 @@
             weight: 2,
           })
             .bindPopup(point.label)
-            .addTo(gridLayer);
-        });
+            .addTo(gridLayer)
+        );
       }
 
       function drawUserMarker() {
@@ -208,16 +267,27 @@
           .addTo(userMarker);
       }
 
+      // move/zoom/rotate events fire continuously during gestures (60+/s);
+      // coalesce overlay redraws to one per animation frame so dragging and
+      // two-finger rotating stay smooth even with large grids.
+      let redrawScheduled = false;
       function onViewportChanged() {
-        if (suppressEvents) {
+        if (suppressEvents || redrawScheduled) {
           return;
         }
-        const center = map.getCenter();
-        drawGrid(center.lat, center.lng);
-        updateOriginReadout();
+        redrawScheduled = true;
+        requestAnimationFrame(() => {
+          redrawScheduled = false;
+          if (!map) {
+            return;
+          }
+          const center = map.getCenter();
+          drawGrid(center.lat, center.lng);
+          updateOriginReadout();
+        });
       }
 
-      function applyView(centerLat, centerLon, zoom) {
+      function applyView(centerLat, centerLon, zoom, orientationDeg) {
         if (!Number.isFinite(centerLat) || !Number.isFinite(centerLon)) {
           return;
         }
@@ -227,6 +297,13 @@
           Number.isFinite(zoom) ? zoom : map.getZoom(),
           { animate: false }
         );
+        if (
+          Number.isFinite(orientationDeg) &&
+          typeof map.setBearing === "function"
+        ) {
+          // orientationDeg is geographic screen-up; pane rotation is opposite.
+          map.setBearing((360 - orientationDeg) % 360);
+        }
         suppressEvents = false;
         drawGrid(centerLat, centerLon);
         updateOriginReadout();
@@ -243,6 +320,8 @@
             lat: center.lat,
             lon: center.lng,
             zoom: map.getZoom(),
+            // Geographic heading of the row axis (screen-up), not raw pane angle.
+            bearing: screenUpBearing(),
             seq: lastViewSeq,
           },
         });
@@ -298,11 +377,26 @@
       }
 
       function initMap(args) {
+        // args.bearing is geographic row-axis (screen-up); pane angle is opposite.
+        const orientation = Number(args.bearing);
+        const initialBearing = Number.isFinite(orientation)
+          ? (360 - orientation) % 360
+          : 0;
         map = L.map("map", {
           center: [Number(args.center_lat), Number(args.center_lon)],
           zoom: Number(args.zoom) || 19,
           zoomControl: true,
           maxZoom: 25,
+          rotate: true,
+          bearing: initialBearing,
+          touchRotate: true,
+          shiftKeyRotate: true,
+          // closeOnZeroBearing:false keeps the compass needle control visible
+          // even when north-up so users can re-enable two-finger rotate.
+          rotateControl: {
+            closeOnZeroBearing: false,
+            position: "topleft",
+          },
         });
 
         L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -323,10 +417,27 @@
         gridLayer = L.layerGroup().addTo(map);
         userMarker = L.layerGroup().addTo(map);
 
+        let viewportPushTimer = null;
+        function scheduleViewportPush() {
+          if (suppressEvents) {
+            return;
+          }
+          // Debounce all origin reports so a pan/rotate gesture becomes one
+          // Streamlit fragment rerun instead of a flood of them.
+          clearTimeout(viewportPushTimer);
+          viewportPushTimer = setTimeout(pushViewportToStreamlit, 250);
+        }
+
+        function onRotateChanged() {
+          onViewportChanged();
+          scheduleViewportPush();
+        }
+
         map.on("move", onViewportChanged);
         map.on("zoom", onViewportChanged);
-        map.on("moveend", pushViewportToStreamlit);
-        map.on("zoomend", pushViewportToStreamlit);
+        map.on("rotate", onRotateChanged);
+        map.on("moveend", scheduleViewportPush);
+        map.on("zoomend", scheduleViewportPush);
 
         // The iframe is sized by Streamlit after the first render message,
         // so re-measure once the height settles to avoid a broken tile grid.
@@ -355,7 +466,8 @@
           applyView(
             Number(args.center_lat),
             Number(args.center_lon),
-            Number(args.zoom)
+            Number(args.zoom),
+            Number(args.bearing)
           );
         } else {
           // Ordinary rerun: keep the user's current view, just refresh

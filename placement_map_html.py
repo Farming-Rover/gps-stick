@@ -26,6 +26,11 @@ def _call_component_json_only(component, *, default=None, key=None, **kwargs):
     and the Raspberry Pi Zero (32-bit ARMv6) can't install PyArrow, so this
     replicates create_instance's JSON-only path (verified against Streamlit
     1.58.0, which must be the version on the Pi).
+
+    Unlike the stock helper (which always uses main_dg), this enqueues into
+    the active DeltaGenerator so a component inside an @st.fragment only
+    triggers a fragment rerun — not a full script rerun — when its value
+    changes. Full reruns of this app are too slow on a Pi Zero for that.
     """
     from streamlit.delta_generator_singletons import get_dg_singleton_instance
     from streamlit.elements.lib.form_utils import current_form_id
@@ -38,7 +43,8 @@ def _call_component_json_only(component, *, default=None, key=None, **kwargs):
 
     serialized_json_args = json.dumps(dict(kwargs, default=default, key=key))
 
-    dg = get_dg_singleton_instance().main_dg
+    # Prefer the fragment/container DG on the context stack when present.
+    dg = get_dg_singleton_instance().main_dg._active_dg
     element = Element()
     instance = element.component_instance
     instance.component_name = component.name
@@ -141,13 +147,14 @@ def render_placement_map(
     user_lon,
     height=520,
     view_seq=0,
+    bearing=0,
 ):
     """Render the grid placement map and return the current grid origin.
 
-    Returns None until the user pans/zooms, then dicts like
-    {"lat": ..., "lon": ..., "zoom": ..., "seq": ...}. The map only snaps its
-    view to (center_lat, center_lon) when view_seq changes; otherwise reruns
-    leave the user's current pan/zoom untouched.
+    Returns None until the user pans/zooms/rotates, then dicts like
+    {"lat": ..., "lon": ..., "zoom": ..., "bearing": ..., "seq": ...}. The map
+    only snaps its view to (center_lat, center_lon, bearing) when view_seq
+    changes; otherwise reruns leave the user's current pan/zoom/rotate alone.
     """
     return _call_component_json_only(
         _placement_map_component,
@@ -161,6 +168,7 @@ def render_placement_map(
         user_lon=float(user_lon),
         height=int(height),
         view_seq=int(view_seq),
+        bearing=float(bearing) % 360.0,
         key="placement_map",
         default=None,
     )
