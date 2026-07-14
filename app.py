@@ -2,6 +2,8 @@ import base64
 import json
 import math
 import re
+import socket
+import threading
 import time
 from pathlib import Path
 
@@ -20,14 +22,32 @@ from placement_map_html import (
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 
-# Base Station Configuration
-BASE_IP = "192.168.1.100"
-BASE_PORT = "2101"
+# RTK2GO NTRIP caster (same settings as ntrip-rover.py)
+NTRIP_HOST = "rtk2go.com"
+NTRIP_PORT = 2101
+NTRIP_USER_EMAIL = "voukich@gmail.com"
+NTRIP_DEFAULT_MOUNTPOINT = "arnoldd"
 
 # st.map size values are in meters (not pixels)
 GRID_MARKER_SIZE_M = 0.8
 TARGET_MARKER_SIZE_M = 1.2
 USER_MARKER_SIZE_M = 0.6
+
+# Shared GNSS serial port (GPS reads + NTRIP RTCM writes). Module-level so the
+# NTRIP background thread can use it across Streamlit script reruns.
+_gps_serial = None
+_gps_serial_lock = threading.Lock()
+
+# NTRIP background client state (survives Streamlit reruns).
+_ntrip_lock = threading.Lock()
+_ntrip_thread = None
+_ntrip_stop = threading.Event()
+_ntrip_desired_mountpoint = None  # None = disconnected / idle
+_ntrip_status = {
+    "state": "idle",  # idle | connecting | connected | error
+    "mountpoint": None,
+    "message": "Not connected",
+}
 
 # --- CORE GEOMETRIC MATH ---
 def get_distance_and_bearing(lat1, lon1, lat2, lon2):
@@ -153,6 +173,30 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         border-color: rgba(239, 108, 0, 0.35);
       }
 
+      .point-toast {
+        position: absolute;
+        top: 56px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1002;
+        max-width: calc(100% - 24px);
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        font: 13px/1.35 sans-serif;
+        color: #222;
+        text-align: center;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.2s ease;
+      }
+
+      .point-toast.visible {
+        opacity: 1;
+      }
+
       .perm-banner {
         position: absolute;
         top: 10px;
@@ -261,6 +305,7 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       <button id="follow-toggle" class="follow-toggle" type="button" title="Toggle whether the map rotates with your heading">
         Map: free rotate
       </button>
+      <div id="point-toast" class="point-toast" aria-live="polite"></div>
       <div class="map-hud">
         <div id="nav-readout" class="nav-readout">Waiting for RTK position from the receiver...</div>
       </div>
@@ -362,6 +407,9 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         let nearest = null;
         let nearestDistance = Infinity;
         MAP_CONFIG.grid_points.forEach((point) => {
+          if (skippedPoints.has(point.point)) {
+            return;
+          }
           const { distance } = getDistanceAndBearing(
             userLat,
             userLon,
@@ -374,10 +422,17 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           }
         });
 
-        if (nearest && nearest.point !== MAP_CONFIG.target_point) {
-          MAP_CONFIG.target_point = nearest.point;
-          MAP_CONFIG.target_lat = nearest.lat;
-          MAP_CONFIG.target_lon = nearest.lon;
+        const nextTarget = nearest ? nearest.point : null;
+        const nextLat = nearest ? nearest.lat : null;
+        const nextLon = nearest ? nearest.lon : null;
+        if (
+          nextTarget !== MAP_CONFIG.target_point ||
+          nextLat !== MAP_CONFIG.target_lat ||
+          nextLon !== MAP_CONFIG.target_lon
+        ) {
+          MAP_CONFIG.target_point = nextTarget;
+          MAP_CONFIG.target_lat = nextLat;
+          MAP_CONFIG.target_lon = nextLon;
           drawGridMarkers();
         }
       }
@@ -404,8 +459,20 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         const targetName = MAP_CONFIG.target_point;
 
         if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
-          readout.textContent = "No grid points available.";
+          const anyActive = MAP_CONFIG.grid_points.some(
+            (point) => !skippedPoints.has(point.point)
+          );
+          readout.textContent = anyActive
+            ? "No grid points available."
+            : "All grid points skipped — tap a yellow point to include it again.";
           readout.className = "nav-readout";
+          publishNavUpdate({
+            distance: null,
+            direction: null,
+            reached: false,
+            target: null,
+            accuracy: MAP_CONFIG.user_accuracy,
+          });
           return;
         }
 
@@ -514,37 +581,91 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       }
 
       const gridMarkersByPoint = new Map();
+      // Yellow / skipped points are ignored when choosing the nearest target.
+      const skippedPoints = new Set();
       let userDotMarker = null;
       let facingConeMarker = null;
       let zoomGestureActive = false;
       let userDrawDeferred = false;
+      let pointToastTimer = null;
 
       function mapBusyWithZoom() {
         return zoomGestureActive || !!(map && map._animatingZoom);
       }
 
+      function showPointToast(text) {
+        const el = document.getElementById("point-toast");
+        if (!el) {
+          return;
+        }
+        el.textContent = text;
+        el.classList.add("visible");
+        clearTimeout(pointToastTimer);
+        pointToastTimer = setTimeout(() => {
+          el.classList.remove("visible");
+        }, 1000);
+      }
+
+      function toggleSkippedPoint(pointName) {
+        if (skippedPoints.has(pointName)) {
+          skippedPoints.delete(pointName);
+          showPointToast(`${pointName} included again`);
+        } else {
+          skippedPoints.add(pointName);
+          showPointToast(`${pointName} excluded`);
+          if (MAP_CONFIG.target_point === pointName) {
+            MAP_CONFIG.target_point = null;
+            MAP_CONFIG.target_lat = null;
+            MAP_CONFIG.target_lon = null;
+          }
+        }
+        drawGridMarkers();
+        updateNavigationHud();
+      }
+
       function drawGridMarkers() {
         MAP_CONFIG.grid_points.forEach((point) => {
-          const isTarget = point.point === MAP_CONFIG.target_point;
-          const icon = makeDotIcon(
-            isTarget ? "#00FF00" : "#1E90FF",
-            isTarget ? 9 : 6,
-            isTarget ? 0.9 : 0.45
-          );
+          const skipped = skippedPoints.has(point.point);
+          const isTarget =
+            !skipped && point.point === MAP_CONFIG.target_point;
+          let color;
+          let radius;
+          let fillOpacity;
+          let zIndex;
+          if (skipped) {
+            color = "#FFD600";
+            radius = 7;
+            fillOpacity = 0.9;
+            zIndex = 300;
+          } else if (isTarget) {
+            color = "#00FF00";
+            radius = 9;
+            fillOpacity = 0.9;
+            zIndex = 400;
+          } else {
+            color = "#1E90FF";
+            radius = 6;
+            fillOpacity = 0.45;
+            zIndex = 200;
+          }
+          const icon = makeDotIcon(color, radius, fillOpacity);
           let marker = gridMarkersByPoint.get(point.point);
           if (!marker) {
             marker = L.marker([point.lat, point.lon], {
               icon,
               keyboard: false,
-              zIndexOffset: isTarget ? 400 : 200,
+              zIndexOffset: zIndex,
             })
-              .bindPopup(point.point)
+              .on("click", (event) => {
+                L.DomEvent.stopPropagation(event);
+                toggleSkippedPoint(point.point);
+              })
               .addTo(map);
             gridMarkersByPoint.set(point.point, marker);
           } else {
             marker.setLatLng([point.lat, point.lon]);
             marker.setIcon(icon);
-            marker.setZIndexOffset(isTarget ? 400 : 200);
+            marker.setZIndexOffset(zIndex);
           }
         });
       }
@@ -1272,24 +1393,182 @@ def _parse_gga_sentence(sentence):
     except (pynmea2.ParseError, pynmea2.ChecksumError):
         return None
 
+def _open_gps_serial_if_needed():
+    """Open the GNSS serial port if needed. Caller must hold `_gps_serial_lock`."""
+    global _gps_serial
+    if _gps_serial is not None:
+        try:
+            if _gps_serial.is_open:
+                return _gps_serial
+        except Exception:
+            pass
+    try:
+        _gps_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        _gps_serial.reset_input_buffer()
+    except Exception:
+        _gps_serial = None
+    return _gps_serial
+
+
 def _ensure_gps_serial():
+    """Open (or re-open) the GNSS serial port used for NMEA reads and RTCM writes."""
     if "last_gps_msg" not in st.session_state:
         st.session_state.last_gps_msg = None
 
-    serial_conn = st.session_state.get("gps_serial")
-    if serial_conn is not None:
+    with _gps_serial_lock:
+        ser = _open_gps_serial_if_needed()
+    st.session_state.gps_serial = ser
+
+
+def _write_rtcm_to_gps(data):
+    """Push RTCM correction bytes to the receiver (called from the NTRIP thread)."""
+    with _gps_serial_lock:
+        ser = _open_gps_serial_if_needed()
+        if ser is None:
+            return False
         try:
-            if serial_conn.is_open:
-                return
+            ser.write(data)
+            return True
+        except Exception:
+            return False
+
+
+def get_ntrip_status():
+    with _ntrip_lock:
+        return dict(_ntrip_status)
+
+
+def _set_ntrip_status(state, message, mountpoint=None):
+    with _ntrip_lock:
+        _ntrip_status["state"] = state
+        _ntrip_status["message"] = message
+        if mountpoint is not None:
+            _ntrip_status["mountpoint"] = mountpoint
+
+
+def _ntrip_request_headers(mountpoint):
+    # RTK2GO: email as username, password "none" (same as ntrip-rover.py).
+    credentials = f"{NTRIP_USER_EMAIL}:none"
+    encoded_creds = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+    req = f"GET /{mountpoint} HTTP/1.0\r\n"
+    req += "User-Agent: NTRIP PythonClient/1.0\r\n"
+    req += f"Authorization: Basic {encoded_creds}\r\n"
+    req += "Ntrip-Version: Ntrip/2.0\r\n"
+    req += "Connection: close\r\n\r\n"
+    return req.encode("utf-8")
+
+
+def _ntrip_stream_once(mountpoint, stop_event):
+    """Connect to one RTK2GO mountpoint and relay RTCM until stop or error."""
+    _set_ntrip_status("connecting", f"Connecting to {mountpoint}…", mountpoint)
+    with _gps_serial_lock:
+        if _open_gps_serial_if_needed() is None:
+            raise RuntimeError(f"Cannot open GNSS serial port {SERIAL_PORT}")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15.0)
+    try:
+        sock.connect((NTRIP_HOST, NTRIP_PORT))
+        sock.sendall(_ntrip_request_headers(mountpoint))
+        response = sock.recv(1024).decode("utf-8", errors="ignore")
+        if not (
+            "ICY 200 OK" in response
+            or "HTTP/1.0 200 OK" in response
+            or "HTTP/1.1 200 OK" in response
+        ):
+            raise RuntimeError(f"Caster rejected mountpoint: {response.strip()[:200]}")
+
+        _set_ntrip_status(
+            "connected",
+            f"Streaming RTCM from {mountpoint}",
+            mountpoint,
+        )
+        sock.settimeout(5.0)
+        while not stop_event.is_set():
+            with _ntrip_lock:
+                desired = _ntrip_desired_mountpoint
+            if desired != mountpoint:
+                break
+            try:
+                data = sock.recv(2048)
+            except socket.timeout:
+                continue
+            if not data:
+                raise RuntimeError("Connection closed by caster")
+            if not _write_rtcm_to_gps(data):
+                raise RuntimeError("GNSS serial port write failed")
+    finally:
+        try:
+            sock.close()
         except Exception:
             pass
 
-    try:
-        serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-        serial_conn.reset_input_buffer()
-        st.session_state.gps_serial = serial_conn
-    except Exception:
-        st.session_state.gps_serial = None
+
+def _ntrip_worker():
+    """Background loop: keep streaming the selected mountpoint, reconnecting on errors."""
+    delay = 5
+    while not _ntrip_stop.is_set():
+        with _ntrip_lock:
+            mountpoint = _ntrip_desired_mountpoint
+        if not mountpoint:
+            _set_ntrip_status("idle", "Not connected", None)
+            time.sleep(0.4)
+            continue
+        try:
+            _ntrip_stream_once(mountpoint, _ntrip_stop)
+        except Exception as exc:
+            with _ntrip_lock:
+                still_wanted = _ntrip_desired_mountpoint == mountpoint
+            if still_wanted and not _ntrip_stop.is_set():
+                delay = min(delay * 2, 300)
+                _set_ntrip_status(
+                    "error",
+                    f"{exc}. Reconnecting in {delay}s…",
+                    mountpoint,
+                )
+                # Interruptible wait so Disconnect is responsive.
+                for _ in range(int(delay * 10)):
+                    if _ntrip_stop.is_set():
+                        break
+                    with _ntrip_lock:
+                        if _ntrip_desired_mountpoint != mountpoint:
+                            break
+                    time.sleep(0.1)
+
+
+def _ensure_ntrip_thread():
+    global _ntrip_thread
+    with _ntrip_lock:
+        if _ntrip_thread is not None and _ntrip_thread.is_alive():
+            return
+        _ntrip_stop.clear()
+        _ntrip_thread = threading.Thread(
+            target=_ntrip_worker,
+            name="ntrip-rtcm",
+            daemon=True,
+        )
+        _ntrip_thread.start()
+
+
+def start_ntrip(mountpoint):
+    """Start (or switch) RTK2GO streaming for the given mountpoint."""
+    global _ntrip_desired_mountpoint
+    cleaned = (mountpoint or "").strip().lstrip("/")
+    if not cleaned:
+        raise ValueError("Mountpoint cannot be empty")
+    _ensure_ntrip_thread()
+    with _ntrip_lock:
+        _ntrip_desired_mountpoint = cleaned
+    _set_ntrip_status("connecting", f"Connecting to {cleaned}…", cleaned)
+
+
+def stop_ntrip():
+    """Stop streaming corrections (worker thread stays idle for a later connect)."""
+    global _ntrip_desired_mountpoint
+    with _ntrip_lock:
+        _ntrip_desired_mountpoint = None
+    _set_ntrip_status("idle", "Not connected", None)
+
 
 def poll_gps(timeout_s=0.15):
     """Read buffered serial data and return the latest valid GGA fix.
@@ -1306,24 +1585,27 @@ def poll_gps(timeout_s=0.15):
     deadline = time.time() + max(0.0, float(timeout_s))
 
     while True:
-        try:
-            waiting = ser.in_waiting
-        except Exception:
-            break
+        line = None
+        waiting = 0
+        with _gps_serial_lock:
+            try:
+                waiting = ser.in_waiting
+            except Exception:
+                break
+
+            if waiting > 0:
+                try:
+                    line = ser.readline().decode("ascii", errors="replace").strip()
+                except Exception:
+                    break
 
         if waiting <= 0:
             if st.session_state.get("last_gps_msg") is not None:
                 break
             if time.time() >= deadline:
                 break
-            # Yield so Streamlit / the serial buffer can produce data.
             time.sleep(0.02)
             continue
-
-        try:
-            line = ser.readline().decode("ascii", errors="replace").strip()
-        except Exception:
-            break
 
         if line:
             for sentence in _iter_nmea_sentences(line):
@@ -1504,6 +1786,43 @@ apply_pending_saved_grid_choice()
 
 
 with st.sidebar:
+    st.header("NTRIP (RTK2GO)")
+
+    @st.fragment(run_every=2.0)
+    def render_ntrip_controls():
+        if "ntrip_mountpoint_input" not in st.session_state:
+            st.session_state.ntrip_mountpoint_input = NTRIP_DEFAULT_MOUNTPOINT
+        mountpoint = st.text_input(
+            "Mountpoint",
+            key="ntrip_mountpoint_input",
+            help=f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}",
+        )
+        col_connect, col_disconnect = st.columns(2)
+        with col_connect:
+            if st.button("Connect", use_container_width=True, type="primary"):
+                try:
+                    start_ntrip(mountpoint)
+                except ValueError as exc:
+                    st.error(str(exc))
+        with col_disconnect:
+            if st.button("Disconnect", use_container_width=True):
+                stop_ntrip()
+
+        status = get_ntrip_status()
+        state = status.get("state", "idle")
+        message = status.get("message", "")
+        if state == "connected":
+            st.success(message)
+        elif state == "connecting":
+            st.info(message)
+        elif state == "error":
+            st.warning(message)
+        else:
+            st.caption(message)
+        st.caption(f"Caster: {NTRIP_HOST}:{NTRIP_PORT} · user: {NTRIP_USER_EMAIL}")
+
+    render_ntrip_controls()
+
     st.header("Grid Settings")
 
     @st.fragment
@@ -1631,7 +1950,6 @@ if not st.session_state.grid_finalized:
         orientation = current_grid_orientation_deg()
         st.markdown(
             "**Legend:** green = grid origin · blue = preview points · red = your position  \n"
-            f"Orientation: **{orientation:.1f}°** from north (row axis toward top of screen)"
         )
     with col_finalize:
         if st.button("Finalize grid location", type="primary", use_container_width=True):
@@ -1723,6 +2041,8 @@ else:
         "Tap **Enable compass** on the map. Your position comes from the RTK receiver on "
         "the stick; you are guided to the nearest grid point (highlighted green), and "
         "directions are relative to the way you are facing. "
+        "Tap a blue grid point to mark it yellow and skip it as a target; tap again to "
+        "include it. "
         "After finalize, the grid is locked to the terrain — rotating the map (or "
         "compass-follow) turns the view while keeping grid points on the ground. "
         "To change grid orientation, use **Adjust grid placement**."
