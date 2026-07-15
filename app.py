@@ -1413,7 +1413,7 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       .arrow-wrap {
         flex: 1 1 auto;
         width: 100%;
-        min-height: 280px;
+        min-height: 220px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1422,8 +1422,8 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
 
       .arrow {
         position: relative;
-        width: min(72vw, 280px);
-        height: min(90vw, 340px);
+        width: min(58vw, 220px);
+        height: min(72vw, 270px);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1454,20 +1454,6 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         pointer-events: none;
       }
 
-      .arrow-svg {
-        fill: #e3f2fd;
-        opacity: 0.9;
-      }
-
-      .arrow.disabled {
-        opacity: 0.35;
-        background: radial-gradient(
-          circle at 50% 45%,
-          rgba(158, 158, 158, 0.25) 0%,
-          rgba(158, 158, 158, 0) 70%
-        );
-      }
-
       .arrow.disabled .arrow-svg {
         filter: none;
         opacity: 0.55;
@@ -1478,8 +1464,7 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         stroke: #757575;
       }
 
-      .arrow.disabled .arrow-svg .arrow-sheen,
-      .arrow.disabled .arrow-svg {
+      .arrow.disabled .arrow-svg .arrow-sheen {
         display: none;
       }
 
@@ -1489,12 +1474,12 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
 
       .reached-mark {
         display: none;
-        width: min(56vw, 180px);
-        height: min(56vw, 180px);
+        width: min(44vw, 140px);
+        height: min(44vw, 140px);
         border-radius: 50%;
         background: radial-gradient(circle at 40% 35%, #66bb6a, #1b5e20);
         color: #fff;
-        font-size: min(28vw, 96px);
+        font-size: min(22vw, 72px);
         font-weight: 700;
         line-height: 1;
         align-items: center;
@@ -1626,6 +1611,30 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
       const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
 
+      // Cumulative CSS angle so 359°→0° takes the short path instead of
+      // spinning ~359° the long way around (0 and 360 are the same heading).
+      let arrowRotCum = null;
+
+      function setArrowRotation(degrees) {
+        const arrow = document.getElementById("nav-arrow");
+        if (!arrow) {
+          return;
+        }
+        if (!Number.isFinite(degrees)) {
+          arrowRotCum = null;
+          arrow.style.transform = "rotate(0deg)";
+          return;
+        }
+        const target = ((Number(degrees) % 360) + 360) % 360;
+        if (arrowRotCum == null) {
+          arrowRotCum = target;
+        } else {
+          const currentMod = ((arrowRotCum % 360) + 360) % 360;
+          arrowRotCum += ((target - currentMod + 540) % 360) - 180;
+        }
+        arrow.style.transform = `rotate(${arrowRotCum}deg)`;
+      }
+
       function formatDistance(meters) {
         if (meters == null || !Number.isFinite(Number(meters))) {
           return "--";
@@ -1677,36 +1686,36 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         const bearing = Number(payload.relative_bearing);
         if (Number.isFinite(bearing)) {
           arrow.classList.remove("disabled");
-          arrow.style.transform = `rotate(${bearing}deg)`;
+          setArrowRotation(bearing);
           statusLine.textContent = `Target${targetSuffix}`;
           statusLine.className = "status";
         } else if (payload.sensorIssue === "insecure") {
           arrow.classList.add("disabled");
-          arrow.style.transform = "rotate(0deg)";
+          setArrowRotation(null);
           statusLine.textContent =
             "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
           statusLine.className = "status warn";
         } else if (payload.sensorIssue === "desktop") {
           arrow.classList.add("disabled");
-          arrow.style.transform = "rotate(0deg)";
+          setArrowRotation(null);
           statusLine.textContent =
             "Desktop detected: compass orientation is not available. Use a phone or tablet for the heading arrow.";
           statusLine.className = "status warn";
         } else if (payload.sensorIssue === "no-compass") {
           arrow.classList.add("disabled");
-          arrow.style.transform = "rotate(0deg)";
+          setArrowRotation(null);
           statusLine.textContent =
             "This device is not reporting compass data. Distance still works, but the heading arrow is unavailable.";
           statusLine.className = "status warn";
         } else if (payload.distance == null) {
           arrow.classList.add("disabled");
-          arrow.style.transform = "rotate(0deg)";
+          setArrowRotation(null);
           statusLine.textContent =
             "Waiting for RTK position and an active grid target.";
           statusLine.className = "status warn";
         } else {
           arrow.classList.add("disabled");
-          arrow.style.transform = "rotate(0deg)";
+          setArrowRotation(null);
           statusLine.textContent =
             "Waiting for compass heading from this device.";
           statusLine.className = "status warn";
