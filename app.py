@@ -26,7 +26,7 @@ BAUD_RATE = 115200
 NTRIP_HOST = "rtk2go.com"
 NTRIP_PORT = 2101
 NTRIP_USER_EMAIL = "voukich@gmail.com"
-NTRIP_DEFAULT_MOUNTPOINT = "arnoldd"
+NTRIP_DEFAULT_MOUNTPOINT = "CA_SanJose_ML_X5"
 
 # st.map size values are in meters (not pixels)
 GRID_MARKER_SIZE_M = 0.8
@@ -84,28 +84,182 @@ def offset_latlon(lat, lon, bearing_deg, distance_m):
     )
     return math.degrees(lat2), math.degrees(lon2)
 
-def generate_grid(origin_lat, origin_lon, rows, cols, spacing_meters, orientation_deg=0):
-    """Build a grid whose row axis points along orientation_deg (0=N, screen-up during placement)."""
-    grid = []
+def _row_is_odd(row_index):
+    """True for odd lattice rows (including negatives: -1, -3, ...)."""
+    return ((int(row_index) % 2) + 2) % 2 == 1
+
+
+def _local_row_col_meters(origin_lat, origin_lon, lat, lon, orientation_deg):
+    """Project (lat, lon) into meters along the grid row/col axes from origin."""
+    north_m = (float(lat) - float(origin_lat)) * 111320.0
+    east_m = (
+        (float(lon) - float(origin_lon))
+        * 111320.0
+        * math.cos(math.radians(float(origin_lat)))
+    )
+    theta = math.radians(float(orientation_deg) % 360.0)
+    # Unit along row bearing (0=N): (north, east) = (cos θ, sin θ)
+    row_m = north_m * math.cos(theta) + east_m * math.sin(theta)
+    # Unit along col bearing (θ+90): (-sin θ, cos θ)
+    col_m = -north_m * math.sin(theta) + east_m * math.cos(theta)
+    return row_m, col_m
+
+
+def _nearest_lattice_indices(row_m, col_m, spacing_meters, staggered):
+    """Snap local meters to the nearest (row, col) lattice indices."""
+    spacing = float(spacing_meters)
+    r0 = int(round(row_m / spacing))
+    best = None
+    for r in (r0 - 1, r0, r0 + 1):
+        stagger = (spacing / 2.0) if (staggered and _row_is_odd(r)) else 0.0
+        c = int(round((col_m - stagger) / spacing))
+        for candidate_c in (c - 1, c, c + 1):
+            d_row = row_m - r * spacing
+            d_col = col_m - (candidate_c * spacing + stagger)
+            dist2 = d_row * d_row + d_col * d_col
+            if best is None or dist2 < best[0]:
+                best = (dist2, r, candidate_c)
+    return best[1], best[2]
+
+
+def _grid_point_latlon(
+    origin_lat, origin_lon, row_index, col_index, spacing_meters, orientation_deg, staggered
+):
     row_bearing = float(orientation_deg) % 360.0
     col_bearing = (row_bearing + 90.0) % 360.0
-    for r in range(rows):
-        stagger = (spacing_meters / 2.0) if r % 2 == 1 else 0.0
-        for c in range(cols):
-            point_lat, point_lon = offset_latlon(
-                origin_lat, origin_lon, row_bearing, r * spacing_meters
-            )
-            point_lat, point_lon = offset_latlon(
-                point_lat, point_lon, col_bearing, c * spacing_meters + stagger
+    stagger = (
+        (float(spacing_meters) / 2.0)
+        if (staggered and _row_is_odd(row_index))
+        else 0.0
+    )
+    point_lat, point_lon = offset_latlon(
+        origin_lat, origin_lon, row_bearing, row_index * spacing_meters
+    )
+    return offset_latlon(
+        point_lat, point_lon, col_bearing, col_index * spacing_meters + stagger
+    )
+
+
+def generate_grid(
+    origin_lat,
+    origin_lon,
+    rows,
+    cols,
+    spacing_meters,
+    orientation_deg=0,
+    staggered=True,
+):
+    """Build a finite grid whose row axis points along orientation_deg (0=N)."""
+    grid = []
+    for r in range(int(rows)):
+        for c in range(int(cols)):
+            point_lat, point_lon = _grid_point_latlon(
+                origin_lat,
+                origin_lon,
+                r,
+                c,
+                spacing_meters,
+                orientation_deg,
+                staggered,
             )
             grid.append({
-                "Point": f"R{r+1}C{c+1}",
+                "Point": f"R{r + 1}C{c + 1}",
                 "lat": point_lat,
                 "lon": point_lon,
                 "color": "#1E90FF",
                 "size": GRID_MARKER_SIZE_M,
             })
     return pd.DataFrame(grid)
+
+
+def generate_endless_grid_window(
+    origin_lat,
+    origin_lon,
+    user_lat,
+    user_lon,
+    extent_m,
+    extent_e,
+    spacing_meters,
+    orientation_deg=0,
+    staggered=True,
+):
+    """Build a sliding window of an infinite lattice around the user.
+
+    Origin/orientation/spacing stay fixed. Rows/cols are extents (how many
+    spacing steps to draw in each direction from the lattice cell nearest the
+    user). Point labels use absolute lattice indices (R0C0 at the origin) so
+    skip state stays stable as the window moves.
+    """
+    row_m, col_m = _local_row_col_meters(
+        origin_lat, origin_lon, user_lat, user_lon, orientation_deg
+    )
+    center_r, center_c = _nearest_lattice_indices(
+        row_m, col_m, spacing_meters, staggered
+    )
+    extent_m = max(1, int(extent_m))
+    extent_e = max(1, int(extent_e))
+    grid = []
+    for r in range(center_r - extent_m, center_r + extent_m + 1):
+        for c in range(center_c - extent_e, center_c + extent_e + 1):
+            point_lat, point_lon = _grid_point_latlon(
+                origin_lat,
+                origin_lon,
+                r,
+                c,
+                spacing_meters,
+                orientation_deg,
+                staggered,
+            )
+            grid.append({
+                "Point": f"R{r}C{c}",
+                "lat": point_lat,
+                "lon": point_lon,
+                "color": "#1E90FF",
+                "size": GRID_MARKER_SIZE_M,
+            })
+    return pd.DataFrame(grid), (center_r, center_c)
+
+
+def grid_df_to_points(df):
+    return [
+        {"point": row["Point"], "lat": float(row["lat"]), "lon": float(row["lon"])}
+        for _, row in df.iterrows()
+    ]
+
+
+def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing):
+    """Build the active grid DataFrame from current session settings."""
+    origin_lat = float(st.session_state.preview_origin_lat)
+    origin_lon = float(st.session_state.preview_origin_lon)
+    orientation = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
+    if st.session_state.get("grid_finalized") and "grid_orientation_deg" in st.session_state:
+        orientation = float(st.session_state.grid_orientation_deg) % 360.0
+    staggered = bool(st.session_state.get("grid_staggered", True))
+    if st.session_state.get("grid_endless", False):
+        df, center = generate_endless_grid_window(
+            origin_lat,
+            origin_lon,
+            user_lat,
+            user_lon,
+            line_count_m,
+            line_count_e,
+            spacing,
+            orientation,
+            staggered,
+        )
+        return df, center
+    return (
+        generate_grid(
+            origin_lat,
+            origin_lon,
+            line_count_m,
+            line_count_e,
+            spacing,
+            orientation,
+            staggered,
+        ),
+        None,
+    )
 
 _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -264,8 +418,8 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         height: 48px;
         /* Pivot on the cone apex (bottom-center), which sits on the user dot. */
         transform-origin: 20px 46px;
-        /* Heading refreshes at 0.5 Hz; glide between steps instead of jumping. */
-        transition: transform 1.8s ease;
+        /* Short ease so turns feel immediate without snapping to sensor noise. */
+        transition: transform 0.12s ease-out;
       }
 
       .follow-toggle {
@@ -320,6 +474,10 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       );
 
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
+      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+      if (MAP_CONFIG.reach_tolerance_m == null) {
+        MAP_CONFIG.reach_tolerance_m = 0.015;
+      }
       let sensorIssue = null; // "insecure" | "desktop" | "no-compass"
       let orientationEventSeen = false;
       // When true, the map bearing tracks our smoothed compass heading.
@@ -343,6 +501,7 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         }
         publishNavUpdate({
           distance: null,
+          relative_bearing: null,
           direction: null,
           reached: false,
           sensorIssue: issue,
@@ -445,10 +604,20 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 
         const userLat = Number(MAP_CONFIG.user_lat);
         const userLon = Number(MAP_CONFIG.user_lon);
+        const toleranceM = Number(MAP_CONFIG.reach_tolerance_m);
+        const reachTol =
+          Number.isFinite(toleranceM) && toleranceM > 0 ? toleranceM : 0.015;
 
         if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
           readout.textContent = "Waiting for RTK position from the receiver...";
           readout.className = "nav-readout";
+          publishNavUpdate({
+            distance: null,
+            relative_bearing: null,
+            direction: null,
+            reached: false,
+            tolerance_m: reachTol,
+          });
           return;
         }
 
@@ -468,10 +637,12 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           readout.className = "nav-readout";
           publishNavUpdate({
             distance: null,
+            relative_bearing: null,
             direction: null,
             reached: false,
             target: null,
             accuracy: MAP_CONFIG.user_accuracy,
+            tolerance_m: reachTol,
           });
           return;
         }
@@ -483,15 +654,18 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           targetLon
         );
 
-        if (distance < 0.015) {
-          readout.textContent = `${targetName} REACHED (within 1.5 cm)!`;
+        if (distance < reachTol) {
+          const tolCm = (reachTol * 100).toFixed(reachTol * 100 < 10 ? 1 : 0);
+          readout.textContent = `${targetName} REACHED (within ${tolCm} cm)!`;
           readout.className = "nav-readout reached";
           publishNavUpdate({
-            distance,
+            distance: 0,
+            relative_bearing: 0,
             direction: "forward",
             reached: true,
             target: targetName,
             accuracy: MAP_CONFIG.user_accuracy,
+            tolerance_m: reachTol,
           });
           return;
         }
@@ -517,25 +691,30 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
             accuracyNote;
           publishNavUpdate({
             distance,
+            relative_bearing: null,
             direction: null,
             reached: false,
             target: targetName,
             accuracy,
             sensorIssue,
+            tolerance_m: reachTol,
           });
           return;
         }
 
         const direction = getRelativeDirection(heading, bearing);
+        const relativeBearing = (bearing - heading + 360) % 360;
         readout.textContent =
           `${directionLabel(direction)} · ${distance.toFixed(2)} m to ${targetName}` +
           accuracyNote;
         publishNavUpdate({
           distance,
+          relative_bearing: relativeBearing,
           direction,
           reached: false,
           target: targetName,
           accuracy,
+          tolerance_m: reachTol,
         });
       }
 
@@ -624,6 +803,23 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       }
 
       function drawGridMarkers() {
+        const keep = new Set(
+          MAP_CONFIG.grid_points.map((point) => point.point)
+        );
+        gridMarkersByPoint.forEach((marker, pointName) => {
+          if (!keep.has(pointName)) {
+            map.removeLayer(marker);
+            gridMarkersByPoint.delete(pointName);
+          }
+        });
+        if (
+          MAP_CONFIG.target_point != null &&
+          !keep.has(MAP_CONFIG.target_point)
+        ) {
+          MAP_CONFIG.target_point = null;
+          MAP_CONFIG.target_lat = null;
+          MAP_CONFIG.target_lon = null;
+        }
         MAP_CONFIG.grid_points.forEach((point) => {
           const skipped = skippedPoints.has(point.point);
           const isTarget =
@@ -760,13 +956,15 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       let headingRefreshTimer = null;
       let mapBearingTimer = null;
       let lastAppliedMapBearing = null;
-      const HEADING_SMOOTHING = 0.2; // lower = smoother; filter runs every sensor tick
-      // Cone refresh: 0.5 Hz. Map follow mode uses a separate ~30 fps loop so
-      // terrain tracks the phone smoothly while the cone stays calm.
-      const HEADING_REFRESH_MS = 2000;
+      // Higher = snappier (closer to raw). Still an EMA on sin/cos so wrap and
+      // magnetometer jitter stay filtered instead of driving the UI raw.
+      const HEADING_SMOOTHING = 0.35;
+      // Cone + nav arrow refresh (~10 Hz). Map follow stays on its own ~30 fps
+      // loop. Latency came mostly from the old 0.5 Hz UI sample + 1.8s CSS ease.
+      const HEADING_REFRESH_MS = 100;
       const MAP_BEARING_MS = 1000 / 30;
-      // Cone deadband: ignore magnetometer wiggle while standing still.
-      const HEADING_DEADBAND_DEG = 3;
+      // Ignore stillness wiggle, but start tracking real turns sooner than 3°.
+      const HEADING_DEADBAND_DEG = 1.5;
       // Tiny map deadband so 30 fps still feels continuous but skips noise.
       const MAP_BEARING_DEADBAND_DEG = 0.35;
 
@@ -1023,6 +1221,25 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           MAP_CONFIG.user_lat = nextLat;
           MAP_CONFIG.user_lon = nextLon;
           drawUserMarker();
+          return;
+        }
+
+        if (data.action === "updateGridPoints") {
+          const points = Array.isArray(data.grid_points) ? data.grid_points : [];
+          MAP_CONFIG.grid_points = points
+            .map((point) => ({
+              point: String(point.point),
+              lat: Number(point.lat),
+              lon: Number(point.lon),
+            }))
+            .filter(
+              (point) =>
+                point.point &&
+                Number.isFinite(point.lat) &&
+                Number.isFinite(point.lon)
+            );
+          drawGridMarkers();
+          updateNavigationHud();
         }
       }
 
@@ -1132,6 +1349,14 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           gridChannel.onmessage = (event) => {
             handleMapMessage(event.data);
           };
+          const navConfigChannel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
+          navConfigChannel.onmessage = (event) => {
+            const nextTol = Number(event.data && event.data.tolerance_m);
+            if (Number.isFinite(nextTol) && nextTol > 0) {
+              MAP_CONFIG.reach_tolerance_m = nextTol;
+              updateNavigationHud();
+            }
+          };
         }
       } catch (error) {
         // Ignore channel errors on older browsers.
@@ -1170,45 +1395,136 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       body {
         margin: 0;
         padding: 0;
+        height: 100%;
         font-family: sans-serif;
+        background: #f4f6f8;
       }
 
       .panel {
-        border: 1px solid rgba(0, 0, 0, 0.08);
-        border-radius: 8px;
-        padding: 12px 14px;
-        background: #fafafa;
-      }
-
-      .metric-row {
+        box-sizing: border-box;
+        min-height: 100%;
+        padding: 16px 16px 12px;
         display: flex;
-        gap: 12px;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
       }
 
-      .metric {
-        flex: 1;
-        background: #fff;
-        border: 1px solid rgba(0, 0, 0, 0.08);
-        border-radius: 8px;
-        padding: 10px 12px;
+      .arrow-wrap {
+        flex: 1 1 auto;
+        width: 100%;
+        min-height: 280px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
       }
 
-      .metric-label {
-        font-size: 12px;
-        color: #666;
-        margin-bottom: 4px;
+      .arrow {
+        position: relative;
+        width: min(72vw, 280px);
+        height: min(90vw, 340px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transform-origin: 50% 55%;
+        transition: transform 0.12s linear;
       }
 
-      .metric-value {
-        font-size: 20px;
-        font-weight: 600;
-        color: #222;
+      .arrow-svg {
+        position: relative;
+        width: 78%;
+        height: 88%;
+        overflow: visible;
+        filter: drop-shadow(0 10px 18px rgba(13, 71, 161, 0.35));
+        transition: filter 0.2s ease, opacity 0.2s ease;
+      }
+
+      .arrow-svg .arrow-body {
+        fill: url(#arrowFill);
+        stroke: #0d47a1;
+        stroke-width: 5;
+        stroke-linejoin: round;
+        stroke-linecap: round;
+      }
+
+      .arrow-svg .arrow-sheen {
+        fill: url(#arrowSheen);
+        opacity: 0.55;
+        pointer-events: none;
+      }
+
+      .arrow-svg {
+        fill: #e3f2fd;
+        opacity: 0.9;
+      }
+
+      .arrow.disabled {
+        opacity: 0.35;
+        background: radial-gradient(
+          circle at 50% 45%,
+          rgba(158, 158, 158, 0.25) 0%,
+          rgba(158, 158, 158, 0) 70%
+        );
+      }
+
+      .arrow.disabled .arrow-svg {
+        filter: none;
+        opacity: 0.55;
+      }
+
+      .arrow.disabled .arrow-svg .arrow-body {
+        fill: #9e9e9e;
+        stroke: #757575;
+      }
+
+      .arrow.disabled .arrow-svg .arrow-sheen,
+      .arrow.disabled .arrow-svg {
+        display: none;
+      }
+
+      .arrow.reached {
+        display: none;
+      }
+
+      .reached-mark {
+        display: none;
+        width: min(56vw, 180px);
+        height: min(56vw, 180px);
+        border-radius: 50%;
+        background: radial-gradient(circle at 40% 35%, #66bb6a, #1b5e20);
+        color: #fff;
+        font-size: min(28vw, 96px);
+        font-weight: 700;
+        line-height: 1;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 12px 28px rgba(27, 94, 32, 0.35);
+      }
+
+      .reached-mark.visible {
+        display: flex;
+      }
+
+      .distance-block {
+        text-align: center;
+        width: 100%;
+      }
+
+      .distance-value {
+        font-size: 42px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #111;
+        line-height: 1.1;
       }
 
       .status {
-        margin-top: 10px;
-        font-size: 14px;
-        color: #444;
+        margin-top: 4px;
+        font-size: 15px;
+        color: #555;
+        text-align: center;
+        min-height: 1.2em;
       }
 
       .status.success {
@@ -1219,71 +1535,180 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       .status.warn {
         color: #e65100;
       }
+
+      .tolerance-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #777;
+        margin-top: 2px;
+      }
+
+      .tolerance-row input {
+        width: 64px;
+        padding: 4px 6px;
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        border-radius: 6px;
+        font-size: 13px;
+        color: #444;
+        background: #fff;
+      }
     </style>
   </head>
   <body>
     <div class="panel">
-      <div class="metric-row">
-        <div class="metric">
-          <div class="metric-label">Distance to Target</div>
-          <div id="distance-value" class="metric-value">--</div>
+      <div class="arrow-wrap" title="Direction to target relative to the way you are facing">
+        <div id="nav-arrow" class="arrow disabled">
+          <svg
+            class="arrow-svg"
+            viewBox="0 0 200 280"
+            xmlns="http://www.w3.org/2000/svg"
+            aria-hidden="true"
+          >
+            <defs>
+              <linearGradient id="arrowFill" x1="100" y1="16" x2="100" y2="268" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#42a5f5" />
+                <stop offset="45%" stop-color="#1e88e5" />
+                <stop offset="100%" stop-color="#0d47a1" />
+              </linearGradient>
+              <linearGradient id="arrowSheen" x1="70" y1="40" x2="130" y2="220" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#ffffff" stop-opacity="0.55" />
+                <stop offset="55%" stop-color="#ffffff" stop-opacity="0.08" />
+                <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+              </linearGradient>
+            </defs>
+            <!-- Classic navigation arrow: tip, wings, tapered shaft -->
+            <path
+              class="arrow-body"
+              d="M100 18
+                 L178 118
+                 L142 118
+                 L142 250
+                 Q142 266 126 266
+                 L74 266
+                 Q58 266 58 250
+                 L58 118
+                 L22 118
+                 Z"
+            />
+            <path
+              class="arrow-sheen"
+              d="M100 34
+                 L150 108
+                 L128 108
+                 L128 240
+                 L100 240
+                 Z"
+            />
+          </svg>
         </div>
-        <div class="metric">
-          <div class="metric-label">Direction</div>
-          <div id="direction-value" class="metric-value">--</div>
-        </div>
+        <div id="reached-mark" class="reached-mark">✓</div>
       </div>
-      <div id="status-line" class="status">Enable the compass on the map above. Position comes from the RTK receiver.</div>
+      <div class="distance-block">
+        <div id="distance-value" class="distance-value">--</div>
+        <div id="status-line" class="status">Enable the compass on the map below. Position comes from the RTK receiver.</div>
+      </div>
+      <div class="tolerance-row">
+        <label for="tolerance-cm">Reach tolerance</label>
+        <input
+          id="tolerance-cm"
+          type="number"
+          min="0.5"
+          step="0.5"
+          value="1.5"
+        />
+        <span>cm</span>
+      </div>
     </div>
     <script>
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
-      const directionLabels = {
-        forward: "Head forward",
-        back: "Head back",
-        left: "Head left",
-        right: "Head right",
-      };
+      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+
+      function formatDistance(meters) {
+        if (meters == null || !Number.isFinite(Number(meters))) {
+          return "--";
+        }
+        return `${Number(meters).toFixed(2)} m`;
+      }
+
+      function publishTolerance() {
+        const input = document.getElementById("tolerance-cm");
+        const cm = Number(input && input.value);
+        if (!Number.isFinite(cm) || cm <= 0) {
+          return;
+        }
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
+            channel.postMessage({ tolerance_m: cm / 100 });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
 
       function updatePanel(payload) {
         const distanceValue = document.getElementById("distance-value");
-        const directionValue = document.getElementById("direction-value");
         const statusLine = document.getElementById("status-line");
+        const arrow = document.getElementById("nav-arrow");
+        const reachedMark = document.getElementById("reached-mark");
         const targetSuffix = payload.target ? ` to ${payload.target}` : "";
+        const toleranceM = Number(payload.tolerance_m);
+        const tolCm = Number.isFinite(toleranceM)
+          ? (toleranceM * 100).toFixed(toleranceM * 100 < 10 ? 1 : 0)
+          : "1.5";
+
+        distanceValue.textContent = formatDistance(payload.distance);
 
         if (payload.reached) {
-          distanceValue.textContent = "0.00 m";
-          directionValue.textContent = "Arrived";
-          statusLine.textContent = `${payload.target || "TARGET"} REACHED (within 1.5 cm)!`;
+          arrow.classList.add("reached", "disabled");
+          reachedMark.classList.add("visible");
+          statusLine.textContent = `${payload.target || "TARGET"} REACHED (within ${tolCm} cm)!`;
           statusLine.className = "status success";
           return;
         }
 
-        if (payload.distance != null) {
-          distanceValue.textContent = `${Number(payload.distance).toFixed(2)} m`;
-        }
+        reachedMark.classList.remove("visible");
+        arrow.classList.remove("reached");
 
-        if (payload.direction) {
-          directionValue.textContent = directionLabels[payload.direction];
-          statusLine.textContent = `${directionLabels[payload.direction]} for ${Number(payload.distance).toFixed(2)} meters${targetSuffix}`;
+        const bearing = Number(payload.relative_bearing);
+        if (Number.isFinite(bearing)) {
+          arrow.classList.remove("disabled");
+          arrow.style.transform = `rotate(${bearing}deg)`;
+          statusLine.textContent = `Target${targetSuffix}`;
           statusLine.className = "status";
         } else if (payload.sensorIssue === "insecure") {
-          directionValue.textContent = "Unavailable";
+          arrow.classList.add("disabled");
+          arrow.style.transform = "rotate(0deg)";
           statusLine.textContent =
-            "The browser blocks the compass over plain HTTP. Distance from the RTK receiver still works; open the app via HTTPS for directions.";
+            "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
           statusLine.className = "status warn";
         } else if (payload.sensorIssue === "desktop") {
-          directionValue.textContent = "Unavailable";
+          arrow.classList.add("disabled");
+          arrow.style.transform = "rotate(0deg)";
           statusLine.textContent =
-            "Desktop detected: compass orientation is not available. Use a phone or tablet for direction guidance.";
+            "Desktop detected: compass orientation is not available. Use a phone or tablet for the heading arrow.";
           statusLine.className = "status warn";
         } else if (payload.sensorIssue === "no-compass") {
-          directionValue.textContent = "Unavailable";
+          arrow.classList.add("disabled");
+          arrow.style.transform = "rotate(0deg)";
           statusLine.textContent =
-            "This device is not reporting compass data. Distance still works, but facing direction is unavailable.";
+            "This device is not reporting compass data. Distance still works, but the heading arrow is unavailable.";
+          statusLine.className = "status warn";
+        } else if (payload.distance == null) {
+          arrow.classList.add("disabled");
+          arrow.style.transform = "rotate(0deg)";
+          statusLine.textContent =
+            "Waiting for RTK position and an active grid target.";
           statusLine.className = "status warn";
         } else {
-          directionValue.textContent = "--";
-          statusLine.textContent = "Waiting for compass heading from this device.";
+          arrow.classList.add("disabled");
+          arrow.style.transform = "rotate(0deg)";
+          statusLine.textContent =
+            "Waiting for compass heading from this device.";
           statusLine.className = "status warn";
         }
 
@@ -1292,6 +1717,11 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
           statusLine.className = "status warn";
         }
       }
+
+      const toleranceInput = document.getElementById("tolerance-cm");
+      toleranceInput.addEventListener("change", publishTolerance);
+      toleranceInput.addEventListener("input", publishTolerance);
+      publishTolerance();
 
       try {
         if (typeof BroadcastChannel !== "undefined") {
@@ -1345,6 +1775,7 @@ def render_live_field_map(
         "user_lon": user_lon,
         "user_heading": None,
         "user_accuracy": None,
+        "reach_tolerance_m": 0.015,
         "center_lat": center_lat,
         "center_lon": center_lon,
         "zoom": zoom,
@@ -1356,7 +1787,7 @@ def render_live_field_map(
     render_html_embed(html, height=height)
 
 
-def render_live_nav_panel(height=120):
+def render_live_nav_panel(height=460):
     render_html_embed(_LIVE_NAV_PANEL_HTML, height=height)
 
 
@@ -1371,6 +1802,29 @@ def post_user_position_update(user_lat, user_lon, session_key):
         "action": "updateUser",
         "user_lat": position[0],
         "user_lon": position[1],
+    })
+
+
+def post_endless_grid_window_if_needed(user_lat, user_lon):
+    """When endless mode is active, slide the visible lattice window with the user."""
+    if not st.session_state.get("grid_finalized"):
+        return
+    if not st.session_state.get("grid_endless", False):
+        return
+    df, center = build_active_grid_df(
+        user_lat,
+        user_lon,
+        int(st.session_state.get("grid_dim_m", 4)),
+        int(st.session_state.get("grid_dim_e", 4)),
+        float(st.session_state.get("grid_spacing", 2.0)),
+    )
+    if center is not None and st.session_state.get("last_endless_window_key") == center:
+        return
+    st.session_state.last_endless_window_key = center
+    st.session_state.grid_df = df
+    post_map_message({
+        "action": "updateGridPoints",
+        "grid_points": grid_df_to_points(df),
     })
 
 # --- LIVE HARDWARE GPS ---
@@ -1393,6 +1847,37 @@ def _parse_gga_sentence(sentence):
     except (pynmea2.ParseError, pynmea2.ChecksumError):
         return None
 
+
+def _gga_lat_lon(msg):
+    """Return (lat, lon) floats from a GGA message, or None if the fix is unusable.
+
+    Truncated NMEA fields like '3726.' parse as messages but explode when
+    pynmea2 converts DDDMM.MMM → decimal degrees.
+    """
+    if msg is None:
+        return None
+    try:
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return None
+    if abs(lat) > 90.0 or abs(lon) > 180.0:
+        return None
+    return lat, lon
+
+
+def latest_gps_fix():
+    """Latest validated (lat, lon), preferring a cached pair over re-reading the msg."""
+    cached = st.session_state.get("last_gps_lat_lon")
+    if cached is not None:
+        return cached
+    coords = _gga_lat_lon(st.session_state.get("last_gps_msg"))
+    if coords is not None:
+        st.session_state.last_gps_lat_lon = coords
+    return coords
+
 def _open_gps_serial_if_needed():
     """Open the GNSS serial port if needed. Caller must hold `_gps_serial_lock`."""
     global _gps_serial
@@ -1414,6 +1899,8 @@ def _ensure_gps_serial():
     """Open (or re-open) the GNSS serial port used for NMEA reads and RTCM writes."""
     if "last_gps_msg" not in st.session_state:
         st.session_state.last_gps_msg = None
+    if "last_gps_lat_lon" not in st.session_state:
+        st.session_state.last_gps_lat_lon = None
 
     with _gps_serial_lock:
         ser = _open_gps_serial_if_needed()
@@ -1610,8 +2097,10 @@ def poll_gps(timeout_s=0.15):
         if line:
             for sentence in _iter_nmea_sentences(line):
                 msg = _parse_gga_sentence(sentence)
-                if msg is not None:
+                coords = _gga_lat_lon(msg)
+                if coords is not None:
                     st.session_state.last_gps_msg = msg
+                    st.session_state.last_gps_lat_lon = coords
 
         if time.time() >= deadline:
             break
@@ -1636,34 +2125,69 @@ def init_placement_state(current_lat, current_lon):
     if "placement_view_seq" not in st.session_state:
         st.session_state.placement_view_seq = 0
 
+def _heading_delta_deg(a, b):
+    """Smallest signed difference from a to b on a 0–360 circle."""
+    return ((float(b) - float(a) + 180.0) % 360.0) - 180.0
+
+
+def queue_grid_heading_input(orientation_deg):
+    """Stage a heading for the sidebar widget (safe after the widget has mounted)."""
+    st.session_state.pending_heading_from_map = float(orientation_deg) % 360.0
+
+
+def apply_pending_grid_heading_input():
+    """Apply a staged heading to the widget key. Call only before number_input mounts."""
+    if "pending_heading_from_map" not in st.session_state:
+        return
+    st.session_state.grid_heading_input = (
+        float(st.session_state.pop("pending_heading_from_map")) % 360.0
+    )
+
+
+def apply_grid_heading_deg(orientation_deg, *, sync_input=True):
+    """Set grid heading and force the placement map to rotate screen-up to match."""
+    orientation = float(orientation_deg) % 360.0
+    st.session_state.preview_orientation_deg = orientation
+    if sync_input:
+        # Never write the widget key here — it may already be mounted (sidebar
+        # apply path) or live in another fragment (map rotate). Stage instead.
+        queue_grid_heading_input(orientation)
+    st.session_state.placement_view_seq += 1
+
+
 def reset_grid_to_current_position(current_lat, current_lon, line_count_m, line_count_e, spacing):
     st.session_state.preview_origin_lat = current_lat
     st.session_state.preview_origin_lon = current_lon
-    st.session_state.preview_orientation_deg = 0.0
-    st.session_state.placement_view_seq += 1
+    apply_grid_heading_deg(0.0)
+    st.session_state.pop("last_endless_window_key", None)
     if st.session_state.grid_finalized:
-        st.session_state.grid_df = generate_grid(
-            current_lat,
-            current_lon,
-            line_count_m,
-            line_count_e,
-            spacing,
-            st.session_state.preview_orientation_deg,
+        st.session_state.grid_orientation_deg = 0.0
+        df, center = build_active_grid_df(
+            current_lat, current_lon, line_count_m, line_count_e, spacing
         )
+        st.session_state.grid_df = df
+        if center is not None:
+            st.session_state.last_endless_window_key = center
 
 def finalize_grid_location(line_count_m, line_count_e, spacing):
     orientation = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
     st.session_state.preview_orientation_deg = orientation
     # Frozen copy used by save so orientation can't drift after finalize.
     st.session_state.grid_orientation_deg = orientation
-    st.session_state.grid_df = generate_grid(
-        st.session_state.preview_origin_lat,
-        st.session_state.preview_origin_lon,
-        line_count_m,
-        line_count_e,
-        spacing,
-        orientation,
+    user_coords = latest_gps_fix()
+    if user_coords is None:
+        user_lat = float(st.session_state.preview_origin_lat)
+        user_lon = float(st.session_state.preview_origin_lon)
+    else:
+        user_lat, user_lon = user_coords
+    df, center = build_active_grid_df(
+        user_lat, user_lon, line_count_m, line_count_e, spacing
     )
+    st.session_state.grid_df = df
+    if center is not None:
+        st.session_state.last_endless_window_key = center
+    else:
+        st.session_state.pop("last_endless_window_key", None)
     st.session_state.grid_finalized = True
 
 def current_grid_orientation_deg():
@@ -1696,6 +2220,8 @@ def save_grid_to_file(name):
         "rows": int(st.session_state.grid_dim_m),
         "cols": int(st.session_state.grid_dim_e),
         "spacing_m": float(st.session_state.grid_spacing),
+        "staggered": bool(st.session_state.get("grid_staggered", True)),
+        "endless": bool(st.session_state.get("grid_endless", False)),
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     file_path = GRID_SAVE_DIR / f"{safe_name}.json"
@@ -1728,16 +2254,22 @@ def apply_pending_grid_load():
         spacing = max(0.5, float(data["spacing_m"]))
         # Older saves omit orientation; treat them as north-up.
         orientation = float(data.get("orientation_deg", 0.0)) % 360.0
+        staggered = bool(data.get("staggered", True))
+        endless = bool(data.get("endless", False))
     except (KeyError, TypeError, ValueError):
         st.error("That saved grid file is invalid and can't be loaded.")
         return
     st.session_state.grid_dim_m = rows
     st.session_state.grid_dim_e = cols
     st.session_state.grid_spacing = spacing
+    st.session_state.grid_staggered = staggered
+    st.session_state.grid_endless = endless
     st.session_state.preview_origin_lat = origin_lat
     st.session_state.preview_origin_lon = origin_lon
     st.session_state.preview_orientation_deg = orientation
     st.session_state.grid_orientation_deg = orientation
+    queue_grid_heading_input(orientation)
+    st.session_state.pop("last_endless_window_key", None)
     # Open the placement view snapped to the loaded origin/orientation so the
     # user can confirm (or tweak) before pressing "Finalize grid location".
     st.session_state.grid_finalized = False
@@ -1770,16 +2302,18 @@ st.markdown(
 )
 
 msg = poll_gps(timeout_s=0.2)
-if msg is None:
+coords = latest_gps_fix()
+if coords is None:
     # Brief blocking wait for the first fix, then yield back to Streamlit
     # instead of spinning forever in this process (which froze the UI).
-    msg = poll_gps(timeout_s=1.0)
-if msg is None:
-    st.warning("Waiting for GPS fix from the receiver...")
+    poll_gps(timeout_s=1.0)
+    coords = latest_gps_fix()
+if coords is None:
+    st.warning("Waiting for a valid GPS fix from the receiver...")
     time.sleep(0.5)
     st.rerun()
 
-current_lat, current_lon = float(msg.latitude), float(msg.longitude)
+current_lat, current_lon = coords
 init_placement_state(current_lat, current_lon)
 apply_pending_grid_load()
 apply_pending_saved_grid_choice()
@@ -1796,6 +2330,7 @@ with st.sidebar:
             "Mountpoint",
             key="ntrip_mountpoint_input",
             help=f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}",
+            value=NTRIP_DEFAULT_MOUNTPOINT
         )
         col_connect, col_disconnect = st.columns(2)
         with col_connect:
@@ -1827,19 +2362,72 @@ with st.sidebar:
 
     @st.fragment
     def render_grid_settings(current_lat, current_lon):
-        grid_lines_m = st.number_input("Rows", min_value=1, value=4, key="grid_dim_m")
-        grid_lines_e = st.number_input("Columns", min_value=1, value=4, key="grid_dim_e")
+        if "grid_endless" not in st.session_state:
+            st.session_state.grid_endless = False
+        if "grid_staggered" not in st.session_state:
+            st.session_state.grid_staggered = True
+        endless = st.checkbox(
+            "Endless grid",
+            key="grid_endless",
+            help=(
+                "Infinite lattice locked at finalize. Rows/Columns control how many "
+                "spacings to draw around you as you walk."
+            ),
+        )
+        staggered = st.checkbox(
+            "Staggered grid",
+            key="grid_staggered",
+            help="Offset every other row by half a spacing (like brickwork).",
+        )
+        row_label = "Visible rows (spacings)" if endless else "Rows"
+        col_label = "Visible columns (spacings)" if endless else "Columns"
+        grid_lines_m = st.number_input(row_label, min_value=1, value=4, key="grid_dim_m")
+        grid_lines_e = st.number_input(col_label, min_value=1, value=4, key="grid_dim_e")
         spacing = st.number_input(
             "Spacing (Meters)", min_value=0.5, value=2.0, step=0.5, key="grid_spacing"
         )
+        if endless:
+            st.caption(
+                "Endless mode draws lattice points within the extent around your "
+                "position. Origin and orientation stay fixed after finalize."
+            )
+
+        if not st.session_state.get("grid_finalized"):
+            external = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
+            # Pull map/load/reset headings into the widget before it mounts.
+            apply_pending_grid_heading_input()
+            if "grid_heading_input" not in st.session_state:
+                st.session_state.grid_heading_input = external
+
+            heading = st.number_input(
+                "Grid heading (°)",
+                min_value=0.0,
+                max_value=359.9,
+                step=0.5,
+                key="grid_heading_input",
+                help=(
+                    "Degrees clockwise from north for the grid row axis "
+                    "(points toward the top of the phone screen). "
+                    "Changing this rotates the map so the grid stays vertically aligned."
+                ),
+            )
+            typed = float(heading) % 360.0
+            if abs(_heading_delta_deg(external, typed)) > 0.05:
+                # Widget already owns this value — don't rewrite the key.
+                apply_grid_heading_deg(typed, sync_input=False)
+                st.rerun(scope="app")
+        else:
+            st.caption(
+                f"Locked heading: {current_grid_orientation_deg():.1f}° from north "
+                "(Adjust grid placement to change)."
+            )
 
         if st.button("Reset grid to current position", use_container_width=True):
             # Fragment args are frozen at the last full-page run; read the
             # freshest fix (kept up to date by the GPS polling fragments).
-            latest_msg = st.session_state.get("last_gps_msg")
-            if latest_msg is not None:
-                current_lat = float(latest_msg.latitude)
-                current_lon = float(latest_msg.longitude)
+            latest_coords = latest_gps_fix()
+            if latest_coords is not None:
+                current_lat, current_lon = latest_coords
             reset_grid_to_current_position(
                 current_lat, current_lon, grid_lines_m, grid_lines_e, spacing
             )
@@ -1852,15 +2440,42 @@ with st.sidebar:
             st.session_state.live_nav_panel_mounted = False
             st.rerun(scope="app")
 
-        grid_config = (int(grid_lines_m), int(grid_lines_e), float(spacing))
-        if st.session_state.get("last_grid_config_sent") != grid_config:
+        grid_config = (
+            int(grid_lines_m),
+            int(grid_lines_e),
+            float(spacing),
+            bool(staggered),
+            bool(endless),
+        )
+        previous_config = st.session_state.get("last_grid_config_sent")
+        if previous_config != grid_config:
             st.session_state.last_grid_config_sent = grid_config
             post_map_message({
                 "action": "updateGrid",
                 "dim_m": grid_config[0],
                 "dim_e": grid_config[1],
                 "spacing_m": grid_config[2],
+                "staggered": grid_config[3],
+                "endless": grid_config[4],
             })
+            # After finalize, regenerate the live lattice when layout toggles change.
+            if st.session_state.get("grid_finalized") and previous_config is not None:
+                latest_coords = latest_gps_fix()
+                if latest_coords is None:
+                    user_lat = float(st.session_state.preview_origin_lat)
+                    user_lon = float(st.session_state.preview_origin_lon)
+                else:
+                    user_lat, user_lon = latest_coords
+                st.session_state.pop("last_endless_window_key", None)
+                df, center = build_active_grid_df(
+                    user_lat, user_lon, grid_lines_m, grid_lines_e, spacing
+                )
+                st.session_state.grid_df = df
+                if center is not None:
+                    st.session_state.last_endless_window_key = center
+                st.session_state.live_map_mounted = False
+                st.session_state.live_nav_panel_mounted = False
+                st.rerun(scope="app")
 
         st.divider()
         saved_grids = list_saved_grids()
@@ -1892,9 +2507,10 @@ with st.sidebar:
 if not st.session_state.grid_finalized:
     st.subheader("Position Your Grid")
     st.caption(
-        "Pan, rotate, and zoom map to achieve desired grid orientation and position "
-        "The grid origin (in green) stays at the map center. "
-        "Click **Finalize grid location** to confirm the grid position."
+        "Pan and zoom to place the origin, or type a **Grid heading** in the sidebar "
+        "to rotate the map so the grid stays upright on screen. "
+        "The grid origin (green) stays at the map center. "
+        "Click **Finalize grid location** to confirm."
     )
 
     # The map lives in a fragment so each pan-end (which reports the new
@@ -1914,6 +2530,8 @@ if not st.session_state.grid_finalized:
             height=520,
             view_seq=st.session_state.placement_view_seq,
             bearing=float(st.session_state.get("preview_orientation_deg", 0.0)),
+            staggered=bool(st.session_state.get("grid_staggered", True)),
+            endless=bool(st.session_state.get("grid_endless", False)),
         )
         # The component reports the map center after every pan/zoom/rotate.
         # Ignore values tagged with an old view_seq: they predate a "Reset
@@ -1926,20 +2544,22 @@ if not st.session_state.grid_finalized:
             st.session_state.preview_origin_lon = float(map_state["lon"])
             st.session_state.map_zoom = int(map_state["zoom"])
             if map_state.get("bearing") is not None:
-                st.session_state.preview_orientation_deg = (
-                    float(map_state["bearing"]) % 360.0
-                )
+                bearing = float(map_state["bearing"]) % 360.0
+                st.session_state.preview_orientation_deg = bearing
+                # Don't write the sidebar widget key from this fragment — stage it.
+                queue_grid_heading_input(bearing)
 
     placement_map_fragment(current_lat, current_lon)
 
     @st.fragment(run_every=1.0)
     def refresh_placement_user_marker():
-        msg = poll_gps(timeout_s=0.1)
-        if msg is None:
+        poll_gps(timeout_s=0.1)
+        coords = latest_gps_fix()
+        if coords is None:
             return
         post_user_position_update(
-            float(msg.latitude),
-            float(msg.longitude),
+            coords[0],
+            coords[1],
             "placement_user_pos",
         )
 
@@ -2031,21 +2651,23 @@ else:
     if flash:
         st.success(flash)
 
-    grid_points = [
-        {"point": row["Point"], "lat": row["lat"], "lon": row["lon"]}
-        for _, row in df.iterrows()
-    ]
+    grid_points = grid_df_to_points(df)
 
-    st.subheader("Live Field View")
+    st.subheader("Live Navigation")
     st.caption(
-        "Tap **Enable compass** on the map. Your position comes from the RTK receiver on "
-        "the stick; you are guided to the nearest grid point (highlighted green), and "
-        "directions are relative to the way you are facing. "
-        "Tap a blue grid point to mark it yellow and skip it as a target; tap again to "
-        "include it. "
-        "After finalize, the grid is locked to the terrain — rotating the map (or "
-        "compass-follow) turns the view while keeping grid points on the ground. "
-        "To change grid orientation, use **Adjust grid placement**."
+        "Follow the large arrow — it points toward the nearest active grid point "
+        "relative to the way you are facing. Open **Enable compass** on the field map "
+        "below if prompted. Tap a blue grid point to skip it (yellow); tap again to "
+        "include it."
+    )
+    if not st.session_state.get("live_nav_panel_mounted"):
+        render_live_nav_panel(height=460)
+        st.session_state.live_nav_panel_mounted = True
+
+    st.markdown("##### Field map")
+    st.caption(
+        "Secondary map for compass permission, skip-toggles, and context. "
+        "Compass-follow rotates the view while grid points stay locked to the ground."
     )
     if not st.session_state.get("live_map_mounted"):
         render_live_field_map(
@@ -2055,25 +2677,29 @@ else:
             center_lat=current_lat,
             center_lon=current_lon,
             zoom=19,
-            height=520,
+            height=260,
         )
         st.session_state.live_map_mounted = True
-
-    if not st.session_state.get("live_nav_panel_mounted"):
-        render_live_nav_panel()
-        st.session_state.live_nav_panel_mounted = True
 
     @st.fragment(run_every=0.5)
     def refresh_live_user_marker():
         msg = poll_gps(timeout_s=0.1)
-        if msg is None:
+        coords = latest_gps_fix()
+        if coords is None:
             return
-        if int(msg.gps_qual) in [0, 1]:
-            st.warning("RTK fix quality is low. Please check your base station connection.")
+        if msg is not None:
+            try:
+                if int(msg.gps_qual) in [0, 1]:
+                    st.warning(
+                        "RTK fix quality is low. Please check your base station connection."
+                    )
+            except (TypeError, ValueError, AttributeError):
+                pass
         post_user_position_update(
-            float(msg.latitude),
-            float(msg.longitude),
+            coords[0],
+            coords[1],
             "live_user_pos",
         )
+        post_endless_grid_window_if_needed(coords[0], coords[1])
 
     refresh_live_user_marker()

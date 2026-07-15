@@ -123,6 +123,8 @@
         dim_m: 4,
         dim_e: 4,
         spacing_m: 2.0,
+        staggered: true,
+        endless: false,
         user_lat: null,
         user_lon: null,
       };
@@ -133,6 +135,10 @@
           return fallback;
         }
         return parsed;
+      }
+
+      function rowIsOdd(rowIndex) {
+        return (((rowIndex % 2) + 2) % 2) === 1;
       }
 
       function destinationLatLng(lat, lon, bearingDeg, distanceM) {
@@ -176,6 +182,8 @@
         const countM = CONFIG.dim_m;
         const countE = CONFIG.dim_e;
         const spacingMeters = Number(CONFIG.spacing_m);
+        const staggered = CONFIG.staggered !== false;
+        const endless = !!CONFIG.endless;
         const rowBearing = Number.isFinite(rowBearingDeg)
           ? ((rowBearingDeg % 360) + 360) % 360
           : screenUpBearing();
@@ -185,9 +193,15 @@
         // Row axis = screen-up; col axis = screen-right. Recompute against
         // screen-up (not raw getBearing) so the stencil stays fixed on screen
         // while tiles rotate underneath — using +getBearing over-compensates.
-        for (let indexM = 0; indexM < countM; indexM++) {
-          const stagger = indexM % 2 === 1 ? spacingMeters / 2 : 0;
-          for (let indexE = 0; indexE < countE; indexE++) {
+        const rowStart = endless ? -countM : 0;
+        const rowEnd = endless ? countM : countM - 1;
+        const colStart = endless ? -countE : 0;
+        const colEnd = endless ? countE : countE - 1;
+
+        for (let indexM = rowStart; indexM <= rowEnd; indexM++) {
+          const stagger =
+            staggered && rowIsOdd(indexM) ? spacingMeters / 2 : 0;
+          for (let indexE = colStart; indexE <= colEnd; indexE++) {
             let [lat, lon] = destinationLatLng(
               originLat,
               originLon,
@@ -200,11 +214,14 @@
               colBearing,
               indexE * spacingMeters + stagger
             );
+            const isOrigin = indexM === 0 && indexE === 0;
             points.push({
-              label: `R${indexM + 1}C${indexE + 1}`,
+              label: endless
+                ? `R${indexM}C${indexE}`
+                : `R${indexM + 1}C${indexE + 1}`,
               lat,
               lon,
-              isOrigin: indexM === 0 && indexE === 0,
+              isOrigin,
             });
           }
         }
@@ -215,7 +232,11 @@
       function updateOriginReadout() {
         const readout = document.getElementById("origin-readout");
         const bearing = Math.round(screenUpBearing());
-        readout.textContent = `${CONFIG.dim_m}x${CONFIG.dim_e} grid · ${bearing}°`;
+        if (CONFIG.endless) {
+          readout.textContent = `endless ±${CONFIG.dim_m}x±${CONFIG.dim_e} · ${bearing}°`;
+        } else {
+          readout.textContent = `${CONFIG.dim_m}x${CONFIG.dim_e} grid · ${bearing}°`;
+        }
       }
 
       // Marker pool: moving existing markers with setLatLng is far cheaper
@@ -226,7 +247,7 @@
       let gridPoolKey = "";
       function drawGrid(originLat, originLon) {
         const points = generateGrid(originLat, originLon, screenUpBearing());
-        const poolKey = `${CONFIG.dim_m}x${CONFIG.dim_e}`;
+        const poolKey = `${CONFIG.endless ? "E" : "F"}:${CONFIG.dim_m}x${CONFIG.dim_e}:${CONFIG.staggered ? 1 : 0}`;
         if (poolKey === gridPoolKey && gridMarkers.length === points.length) {
           for (let i = 0; i < points.length; i++) {
             gridMarkers[i].setLatLng([points[i].lat, points[i].lon]);
@@ -331,16 +352,22 @@
         const prevM = CONFIG.dim_m;
         const prevE = CONFIG.dim_e;
         const prevSpacing = CONFIG.spacing_m;
+        const prevStaggered = CONFIG.staggered;
+        const prevEndless = CONFIG.endless;
 
         if (data.dim_m != null) CONFIG.dim_m = asCount(data.dim_m, 4);
         if (data.dim_e != null) CONFIG.dim_e = asCount(data.dim_e, 4);
         if (data.spacing_m != null) CONFIG.spacing_m = Number(data.spacing_m);
+        if (data.staggered != null) CONFIG.staggered = !!data.staggered;
+        if (data.endless != null) CONFIG.endless = !!data.endless;
 
         // Duplicate messages arrive from the sender's retries; skip no-op redraws.
         if (
           prevM === CONFIG.dim_m &&
           prevE === CONFIG.dim_e &&
-          prevSpacing === CONFIG.spacing_m
+          prevSpacing === CONFIG.spacing_m &&
+          prevStaggered === CONFIG.staggered &&
+          prevEndless === CONFIG.endless
         ) {
           return;
         }
@@ -452,6 +479,8 @@
         CONFIG.dim_m = asCount(args.dim_m, 4);
         CONFIG.dim_e = asCount(args.dim_e, 4);
         CONFIG.spacing_m = Number(args.spacing_m) || 2.0;
+        CONFIG.staggered = args.staggered !== false;
+        CONFIG.endless = !!args.endless;
         if (args.user_lat != null && args.user_lon != null) {
           CONFIG.user_lat = Number(args.user_lat);
           CONFIG.user_lon = Number(args.user_lon);

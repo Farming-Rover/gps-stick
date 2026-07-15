@@ -7,7 +7,6 @@ import sys
 # --- CONFIGURATION ---
 CAST_HOST = "rtk2go.com"
 CAST_PORT = 2101
-MOUNTPOINT = "arnoldd"
 USER_EMAIL = "voukich@gmail.com"
 SERIAL_PORT = "/dev/ttyACM0"  # Change to match your SparkFun port
 BAUDRATE = 115200             # Standard SparkFun/u-blox baud rate
@@ -59,8 +58,7 @@ if __name__ == "__main__":
     delay = 10
     while True:
         try:
-            mountpoint = sys.argv[1] if len(sys.argv) > 1 else MOUNTPOINT
-            connect_ntrip(mountpoint)
+            connect_ntrip()
             delay = 10 # reset delay on successful connection 
         except Exception as e:
             print(f"Error: {e}. Reconnecting in {delay} seconds...")

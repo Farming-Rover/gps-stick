@@ -148,6 +148,8 @@ def render_placement_map(
     height=520,
     view_seq=0,
     bearing=0,
+    staggered=True,
+    endless=False,
 ):
     """Render the grid placement map and return the current grid origin.
 
@@ -169,6 +171,8 @@ def render_placement_map(
         height=int(height),
         view_seq=int(view_seq),
         bearing=float(bearing) % 360.0,
+        staggered=bool(staggered),
+        endless=bool(endless),
         key="placement_map",
         default=None,
     )
