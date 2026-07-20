@@ -35,8 +35,17 @@ USER_MARKER_SIZE_M = 0.6
 
 # Shared GNSS serial port (GPS reads + NTRIP RTCM writes). Module-level so the
 # NTRIP background thread can use it across Streamlit script reruns.
+#
+# A serial fd is full-duplex: one thread can read NMEA while another writes
+# RTCM at the same time (POSIX tty). So we deliberately use SEPARATE locks:
+#   * _gps_serial_lock guards only opening/reopening the shared handle.
+#   * _gps_read_lock serializes NMEA readers against each other.
+# RTCM writes take NEITHER, so corrections are never starved behind a blocking
+# readline() (that starvation is why the UI couldn't reach RTK float while the
+# standalone ntrip-rover.py — which only writes — could lock).
 _gps_serial = None
 _gps_serial_lock = threading.Lock()
+_gps_read_lock = threading.Lock()
 
 # NTRIP background client state (survives Streamlit reruns).
 _ntrip_lock = threading.Lock()
@@ -1888,20 +1897,21 @@ def latest_gps_fix():
     return coords
 
 def _open_gps_serial_if_needed():
-    """Open the GNSS serial port if needed. Caller must hold `_gps_serial_lock`."""
+    """Return the shared GNSS serial handle, opening it if needed (thread-safe)."""
     global _gps_serial
-    if _gps_serial is not None:
+    with _gps_serial_lock:
+        if _gps_serial is not None:
+            try:
+                if _gps_serial.is_open:
+                    return _gps_serial
+            except Exception:
+                pass
         try:
-            if _gps_serial.is_open:
-                return _gps_serial
+            _gps_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+            _gps_serial.reset_input_buffer()
         except Exception:
-            pass
-    try:
-        _gps_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-        _gps_serial.reset_input_buffer()
-    except Exception:
-        _gps_serial = None
-    return _gps_serial
+            _gps_serial = None
+        return _gps_serial
 
 
 def _ensure_gps_serial():
@@ -1911,22 +1921,27 @@ def _ensure_gps_serial():
     if "last_gps_lat_lon" not in st.session_state:
         st.session_state.last_gps_lat_lon = None
 
-    with _gps_serial_lock:
-        ser = _open_gps_serial_if_needed()
-    st.session_state.gps_serial = ser
+    st.session_state.gps_serial = _open_gps_serial_if_needed()
 
 
 def _write_rtcm_to_gps(data):
-    """Push RTCM correction bytes to the receiver (called from the NTRIP thread)."""
-    with _gps_serial_lock:
-        ser = _open_gps_serial_if_needed()
-        if ser is None:
-            return False
-        try:
-            ser.write(data)
-            return True
-        except Exception:
-            return False
+    """Push RTCM correction bytes to the receiver (called from the NTRIP thread).
+
+    Intentionally does NOT take the NMEA read lock: writing corrections is
+    independent of reading NMEA on a full-duplex serial port, and making writes
+    wait on blocking reads starves the base's RTCM stream (no RTK float).
+    """
+    if not data:
+        return True
+    ser = _open_gps_serial_if_needed()
+    if ser is None:
+        return False
+    try:
+        ser.write(data)
+        ser.flush()
+        return True
+    except Exception:
+        return False
 
 
 def get_ntrip_status():
@@ -1954,19 +1969,40 @@ def _ntrip_request_headers(mountpoint):
     return req.encode("utf-8")
 
 
+def _read_ntrip_headers(sock):
+    """Read until end of HTTP headers; return (header_text, leftover_body_bytes).
+
+    Same logic as ntrip-rover.py: the first TCP chunk often contains both the
+    ICY/HTTP header and the start of the binary RTCM stream. Decoding the whole
+    recv() as UTF-8 and discarding it drops those RTCM bytes and can keep the
+    receiver from ever reaching float/fixed.
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 16384:
+            break
+    header, sep, body = buf.partition(b"\r\n\r\n")
+    if not sep:
+        return buf.decode("utf-8", errors="ignore"), b""
+    return header.decode("utf-8", errors="ignore"), body
+
+
 def _ntrip_stream_once(mountpoint, stop_event):
     """Connect to one RTK2GO mountpoint and relay RTCM until stop or error."""
     _set_ntrip_status("connecting", f"Connecting to {mountpoint}…", mountpoint)
-    with _gps_serial_lock:
-        if _open_gps_serial_if_needed() is None:
-            raise RuntimeError(f"Cannot open GNSS serial port {SERIAL_PORT}")
+    if _open_gps_serial_if_needed() is None:
+        raise RuntimeError(f"Cannot open GNSS serial port {SERIAL_PORT}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(15.0)
     try:
         sock.connect((NTRIP_HOST, NTRIP_PORT))
         sock.sendall(_ntrip_request_headers(mountpoint))
-        response = sock.recv(1024).decode("utf-8", errors="ignore")
+        response, leftover = _read_ntrip_headers(sock)
         if not (
             "ICY 200 OK" in response
             or "HTTP/1.0 200 OK" in response
@@ -1979,6 +2015,9 @@ def _ntrip_stream_once(mountpoint, stop_event):
             f"Streaming RTCM from {mountpoint}",
             mountpoint,
         )
+        if leftover and not _write_rtcm_to_gps(leftover):
+            raise RuntimeError("GNSS serial port write failed")
+
         sock.settimeout(5.0)
         while not stop_event.is_set():
             with _ntrip_lock:
@@ -2083,7 +2122,9 @@ def poll_gps(timeout_s=0.15):
     while True:
         line = None
         waiting = 0
-        with _gps_serial_lock:
+        # Only serialize NMEA readers against each other; RTCM writes run
+        # concurrently on the same full-duplex fd and must never wait here.
+        with _gps_read_lock:
             try:
                 waiting = ser.in_waiting
             except Exception:
@@ -2338,8 +2379,7 @@ with st.sidebar:
         mountpoint = st.text_input(
             "Mountpoint",
             key="ntrip_mountpoint_input",
-            help=f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}",
-            value=NTRIP_DEFAULT_MOUNTPOINT
+            help=f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}"
         )
         col_connect, col_disconnect = st.columns(2)
         with col_connect:
