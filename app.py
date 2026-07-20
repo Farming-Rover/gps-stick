@@ -47,6 +47,12 @@ _gps_serial = None
 _gps_serial_lock = threading.Lock()
 _gps_read_lock = threading.Lock()
 
+# Latest raw GGA sentence read from the board. The NTRIP thread periodically
+# sends this back up to the caster (like ntrip-rover.py) — SNIP/RTK2GO casters
+# generally expect the client to report its position to keep RTCM flowing.
+_latest_gga_sentence = ""
+_latest_gga_lock = threading.Lock()
+
 # NTRIP background client state (survives Streamlit reruns).
 _ntrip_lock = threading.Lock()
 _ntrip_thread = None
@@ -1908,10 +1914,32 @@ def _open_gps_serial_if_needed():
                 pass
         try:
             _gps_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+            # Match ntrip-rover.py's flushInput()/flushOutput() on open.
             _gps_serial.reset_input_buffer()
+            _gps_serial.reset_output_buffer()
         except Exception:
             _gps_serial = None
         return _gps_serial
+
+
+def _set_latest_gga(sentence):
+    """Remember the most recent raw GGA sentence for upload back to the caster."""
+    if not sentence or not sentence.startswith(("$GNGGA", "$GPGGA")):
+        return
+    global _latest_gga_sentence
+    with _latest_gga_lock:
+        _latest_gga_sentence = sentence
+
+
+def _get_latest_gga_for_caster():
+    """Latest GGA as CRLF-terminated bytes, or None if we have not seen one yet."""
+    with _latest_gga_lock:
+        sentence = _latest_gga_sentence
+    if not sentence:
+        return None
+    if not sentence.endswith("\r\n"):
+        sentence = sentence + "\r\n"
+    return sentence.encode("ascii", errors="ignore")
 
 
 def _ensure_gps_serial():
@@ -2019,11 +2047,34 @@ def _ntrip_stream_once(mountpoint, stop_event):
             raise RuntimeError("GNSS serial port write failed")
 
         sock.settimeout(5.0)
+        last_gga_upload = 0.0
+
+        def upload_gga_if_due(force=False):
+            """Report the rover's position to the caster every ~5s (keeps RTCM flowing)."""
+            nonlocal last_gga_upload
+            now = time.time()
+            if not force and now - last_gga_upload < 5.0:
+                return
+            gga = _get_latest_gga_for_caster()
+            if not gga:
+                return
+            try:
+                sock.sendall(gga)
+                last_gga_upload = now
+            except OSError:
+                # Main loop will detect the disconnect on the next recv().
+                pass
+
+        # Send an initial position (if we already have one) so casters that
+        # gate RTCM on a client GGA start streaming immediately.
+        upload_gga_if_due(force=True)
+
         while not stop_event.is_set():
             with _ntrip_lock:
                 desired = _ntrip_desired_mountpoint
             if desired != mountpoint:
                 break
+            upload_gga_if_due()
             try:
                 data = sock.recv(2048)
             except socket.timeout:
@@ -2151,6 +2202,8 @@ def poll_gps(timeout_s=0.15):
                 if coords is not None:
                     st.session_state.last_gps_msg = msg
                     st.session_state.last_gps_lat_lon = coords
+                    # Feed the NTRIP thread the rover position to report upstream.
+                    _set_latest_gga(sentence)
 
         if time.time() >= deadline:
             break
@@ -2600,7 +2653,7 @@ if not st.session_state.grid_finalized:
 
     placement_map_fragment(current_lat, current_lon)
 
-    @st.fragment(run_every=1.0)
+    @st.fragment(run_every=0.5)
     def refresh_placement_user_marker():
         poll_gps(timeout_s=0.1)
         coords = latest_gps_fix()
