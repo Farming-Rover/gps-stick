@@ -14,10 +14,13 @@ import streamlit as st
 
 from placement_map_html import (
     MAP_MESSAGE_TYPE,
+    post_broadcast_message,
     post_map_message,
     render_html_embed,
     render_placement_map,
 )
+import gps_runtime as gps_rt
+import ntrip_runtime as ntrip_rt
 # Serial Port Configuration
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
@@ -44,6 +47,8 @@ USER_MARKER_SIZE_M = 0.6
 # readline() (that starvation is why the UI couldn't reach RTK float while the
 # standalone ntrip-rover.py — which only writes — could lock).
 _gps_serial = None
+_gps_serial_port = SERIAL_PORT
+_gps_serial_error = None
 _gps_serial_lock = threading.Lock()
 _gps_read_lock = threading.Lock()
 
@@ -53,16 +58,83 @@ _gps_read_lock = threading.Lock()
 _latest_gga_sentence = ""
 _latest_gga_lock = threading.Lock()
 
-# NTRIP background client state (survives Streamlit reruns).
-_ntrip_lock = threading.Lock()
-_ntrip_thread = None
-_ntrip_stop = threading.Event()
-_ntrip_desired_mountpoint = None  # None = disconnected / idle
-_ntrip_status = {
-    "state": "idle",  # idle | connecting | connected | error
-    "mountpoint": None,
-    "message": "Not connected",
-}
+NAV_MESSAGE_TYPE = "gps-stick-nav"
+
+
+def rtk_status_from_gps_qual(gps_qual):
+    """Map GGA gps_qual to a short label / CSS class for the live nav bar."""
+    try:
+        qual = int(gps_qual)
+    except (TypeError, ValueError):
+        return {
+            "gps_qual": None,
+            "rtk_label": "Waiting for GPS…",
+            "rtk_class": "unknown",
+        }
+    if qual == 4:
+        return {
+            "gps_qual": qual,
+            "rtk_label": "RTK Fix",
+            "rtk_class": "fix",
+        }
+    if qual == 5:
+        return {
+            "gps_qual": qual,
+            "rtk_label": "RTK Float",
+            "rtk_class": "float",
+        }
+    return {
+        "gps_qual": qual,
+        "rtk_label": "No RTK",
+        "rtk_class": "none",
+    }
+
+
+def _set_latest_gps_quality(msg):
+    """Publish the latest GGA quality for all browser sessions."""
+    if msg is None:
+        return
+    try:
+        qual = int(msg.gps_qual)
+    except (TypeError, ValueError, AttributeError):
+        return
+    num_sats = None
+    try:
+        if getattr(msg, "num_sats", None) not in (None, ""):
+            num_sats = int(msg.num_sats)
+    except (TypeError, ValueError):
+        num_sats = None
+    with gps_rt.lock:
+        gps_rt.gps_qual = qual
+        gps_rt.num_sats = num_sats
+        gps_rt.updated_at = time.time()
+
+
+def get_latest_rtk_status():
+    with gps_rt.lock:
+        qual = gps_rt.gps_qual
+        num_sats = gps_rt.num_sats
+    status = rtk_status_from_gps_qual(qual)
+    status["num_sats"] = num_sats
+    return status
+
+
+def post_rtk_status_update(force=False):
+    """Push current RTK quality to the live nav panel (all sessions share it)."""
+    status = get_latest_rtk_status()
+    key = (status.get("gps_qual"), status.get("rtk_label"), status.get("num_sats"))
+    if not force and st.session_state.get("last_posted_rtk_status") == key:
+        return
+    st.session_state.last_posted_rtk_status = key
+    post_broadcast_message(
+        NAV_MESSAGE_TYPE,
+        {
+            "gps_qual": status.get("gps_qual"),
+            "rtk_label": status.get("rtk_label"),
+            "rtk_class": status.get("rtk_class"),
+            "num_sats": status.get("num_sats"),
+        },
+    )
 
 # --- CORE GEOMETRIC MATH ---
 def get_distance_and_bearing(lat1, lon1, lat2, lon2):
@@ -187,51 +259,38 @@ def generate_grid(
     return pd.DataFrame(grid)
 
 
-def generate_endless_grid_window(
+def generate_nearest_endless_grid_point(
     origin_lat,
     origin_lon,
     user_lat,
     user_lon,
-    extent_m,
-    extent_e,
     spacing_meters,
     orientation_deg=0,
     staggered=True,
 ):
-    """Build a sliding window of an infinite lattice around the user.
-
-    Origin/orientation/spacing stay fixed. Rows/cols are extents (how many
-    spacing steps to draw in each direction from the lattice cell nearest the
-    user). Point labels use absolute lattice indices (R0C0 at the origin) so
-    skip state stays stable as the window moves.
-    """
+    """Return only the closest point in the infinite, oriented lattice."""
     row_m, col_m = _local_row_col_meters(
         origin_lat, origin_lon, user_lat, user_lon, orientation_deg
     )
     center_r, center_c = _nearest_lattice_indices(
         row_m, col_m, spacing_meters, staggered
     )
-    extent_m = max(1, int(extent_m))
-    extent_e = max(1, int(extent_e))
-    grid = []
-    for r in range(center_r - extent_m, center_r + extent_m + 1):
-        for c in range(center_c - extent_e, center_c + extent_e + 1):
-            point_lat, point_lon = _grid_point_latlon(
-                origin_lat,
-                origin_lon,
-                r,
-                c,
-                spacing_meters,
-                orientation_deg,
-                staggered,
-            )
-            grid.append({
-                "Point": f"R{r}C{c}",
-                "lat": point_lat,
-                "lon": point_lon,
-                "color": "#1E90FF",
-                "size": GRID_MARKER_SIZE_M,
-            })
+    point_lat, point_lon = _grid_point_latlon(
+        origin_lat,
+        origin_lon,
+        center_r,
+        center_c,
+        spacing_meters,
+        orientation_deg,
+        staggered,
+    )
+    grid = [{
+        "Point": f"R{center_r}C{center_c}",
+        "lat": point_lat,
+        "lon": point_lon,
+        "color": "#1E90FF",
+        "size": GRID_MARKER_SIZE_M,
+    }]
     return pd.DataFrame(grid), (center_r, center_c)
 
 
@@ -250,14 +309,12 @@ def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing
     if st.session_state.get("grid_finalized") and "grid_orientation_deg" in st.session_state:
         orientation = float(st.session_state.grid_orientation_deg) % 360.0
     staggered = bool(st.session_state.get("grid_staggered", True))
-    if st.session_state.get("grid_endless", False):
-        df, center = generate_endless_grid_window(
+    if st.session_state.get("grid_endless", True):
+        df, center = generate_nearest_endless_grid_point(
             origin_lat,
             origin_lon,
             user_lat,
             user_lon,
-            line_count_m,
-            line_count_e,
             spacing,
             orientation,
             staggered,
@@ -366,54 +423,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         opacity: 1;
       }
 
-      .perm-banner {
-        position: absolute;
-        top: 10px;
-        left: 10px;
-        right: 10px;
-        z-index: 1001;
-        background: rgba(255, 255, 255, 0.96);
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        border-radius: 8px;
-        padding: 10px 12px;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-        pointer-events: auto;
-      }
-
-      .perm-banner p {
-        margin: 0 0 8px;
-        font: 13px/1.4 sans-serif;
-        color: #333;
-      }
-
-      .perm-banner button {
-        border: none;
-        border-radius: 6px;
-        padding: 8px 12px;
-        font: 13px/1.2 sans-serif;
-        font-weight: 600;
-        color: #fff;
-        background: #1565c0;
-        cursor: pointer;
-      }
-
-      .perm-banner button:hover {
-        background: #0d47a1;
-      }
-
-      .perm-banner.hidden {
-        display: none;
-      }
-
-      .desktop-warn {
-        background: rgba(255, 243, 224, 0.96);
-        border-color: rgba(239, 108, 0, 0.35);
-      }
-
-      .desktop-warn p {
-        color: #bf360c;
-      }
-
       /* DivIcon dots live on leaflet-rotate's norotate marker pane so they
          stay locked to lat/lng during zoom/rotate (SVG circleMarkers drift). */
       .gps-stick-dot-icon,
@@ -464,13 +473,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
     <div class="map-shell">
       <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
       <div id="map"></div>
-      <div id="perm-banner" class="perm-banner">
-        <p>Allow this device to use its compass so the map can rotate with your heading and show where you are facing. Your position comes from the RTK receiver on the stick.</p>
-        <button id="enable-sensors" type="button">Enable compass</button>
-      </div>
-      <div id="sensor-warn" class="perm-banner desktop-warn hidden">
-        <p id="sensor-warn-text"></p>
-      </div>
       <button id="follow-toggle" class="follow-toggle" type="button" title="Toggle whether the map rotates with your heading">
         Map: free rotate
       </button>
@@ -490,6 +492,7 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
       const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
       if (MAP_CONFIG.reach_tolerance_m == null) {
         MAP_CONFIG.reach_tolerance_m = 0.015;
       }
@@ -508,12 +511,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
 
       function showSensorWarning(issue, text) {
         sensorIssue = issue;
-        const banner = document.getElementById("sensor-warn");
-        const bannerText = document.getElementById("sensor-warn-text");
-        if (banner && bannerText) {
-          bannerText.textContent = text;
-          banner.classList.remove("hidden");
-        }
         publishNavUpdate({
           distance: null,
           relative_bearing: null,
@@ -521,6 +518,19 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
           reached: false,
           sensorIssue: issue,
         });
+      }
+
+      function applyExternalHeading(heading) {
+        const next = Number(heading);
+        if (!Number.isFinite(next)) {
+          return;
+        }
+        orientationEventSeen = true;
+        if (sensorIssue === "no-compass") {
+          sensorIssue = null;
+        }
+        MAP_CONFIG.user_heading = ((next % 360) + 360) % 360;
+        drawUserMarker();
       }
 
       function getDistanceAndBearing(lat1, lon1, lat2, lon2) {
@@ -1132,10 +1142,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
         orientationEventSeen = true;
         if (sensorIssue === "no-compass") {
           sensorIssue = null;
-          const banner = document.getElementById("sensor-warn");
-          if (banner) {
-            banner.classList.add("hidden");
-          }
         }
 
         const reading = extractHeading(event);
@@ -1197,8 +1203,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
             );
           }
         }, 4000);
-
-        document.getElementById("perm-banner").classList.add("hidden");
       }
 
       async function enableClientSensors() {
@@ -1348,10 +1352,6 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
       }
 
       document
-        .getElementById("enable-sensors")
-        .addEventListener("click", enableClientSensors);
-
-      document
         .getElementById("follow-toggle")
         .addEventListener("click", () => {
           setFollowHeading(!followHeading);
@@ -1370,6 +1370,20 @@ _LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
             if (Number.isFinite(nextTol) && nextTol > 0) {
               MAP_CONFIG.reach_tolerance_m = nextTol;
               updateNavigationHud();
+            }
+          };
+          // Compass is enabled from the Live Navigation panel (not a map
+          // overlay). Heading can arrive from that panel, or this iframe
+          // can start its own sensors when told to enable.
+          const headingChannel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+          headingChannel.onmessage = (event) => {
+            const data = event.data || {};
+            if (data.action === "enableCompass") {
+              enableClientSensors();
+              return;
+            }
+            if (data.heading != null) {
+              applyExternalHeading(data.heading);
             }
           };
         }
@@ -1413,6 +1427,8 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         height: 100%;
         font-family: sans-serif;
         background: #f4f6f8;
+        color: #111;
+        color-scheme: light;
       }
 
       .panel {
@@ -1423,6 +1439,8 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         flex-direction: column;
         align-items: center;
         gap: 10px;
+        background: #f4f6f8;
+        color: #111;
       }
 
       .arrow-wrap {
@@ -1555,10 +1573,191 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         color: #444;
         background: #fff;
       }
+
+      .compass-row {
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .compass-btn {
+        border: none;
+        border-radius: 10px;
+        padding: 12px 18px;
+        font: 15px/1.2 sans-serif;
+        font-weight: 700;
+        color: #fff;
+        background: #1565c0;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(21, 101, 192, 0.28);
+      }
+
+      .compass-btn:hover {
+        background: #0d47a1;
+      }
+
+      .compass-btn.enabled {
+        background: #2e7d32;
+        box-shadow: none;
+        cursor: default;
+      }
+
+      .compass-btn:disabled {
+        opacity: 0.7;
+        cursor: default;
+      }
+
+      .fullscreen-btn {
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 10px;
+        padding: 12px 14px;
+        font: 14px/1.2 sans-serif;
+        font-weight: 600;
+        color: #1565c0;
+        background: #fff;
+        cursor: pointer;
+      }
+
+      .fullscreen-btn:hover {
+        background: #e3f2fd;
+      }
+
+      .rtk-bar {
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font: 600 15px/1.3 sans-serif;
+        letter-spacing: 0.01em;
+        border: 1px solid transparent;
+      }
+
+      .rtk-bar.unknown {
+        color: #555;
+        background: #eceff1;
+        border-color: rgba(0, 0, 0, 0.08);
+      }
+
+      .rtk-bar.none {
+        color: #b71c1c;
+        background: #ffebee;
+        border-color: rgba(183, 28, 28, 0.25);
+      }
+
+      .rtk-bar.float {
+        color: #e65100;
+        background: #fff3e0;
+        border-color: rgba(230, 81, 0, 0.28);
+      }
+
+      .rtk-bar.fix {
+        color: #1b5e20;
+        background: #e8f5e9;
+        border-color: rgba(27, 94, 32, 0.28);
+      }
+
+      .panel.is-fullscreen,
+      .panel:fullscreen,
+      .panel:-webkit-full-screen {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        min-height: 100%;
+        border-radius: 0;
+        z-index: 9999;
+        justify-content: center;
+        /* Force light surface: some phones paint a black fullscreen
+           backdrop while our distance text stays dark (#111). */
+        background: #f4f6f8 !important;
+        color: #111 !important;
+        color-scheme: light;
+      }
+
+      .panel.is-fullscreen .rtk-bar,
+      .panel:fullscreen .rtk-bar,
+      .panel:-webkit-full-screen .rtk-bar {
+        font-size: 18px;
+        padding: 12px 14px;
+      }
+
+      .panel.is-fullscreen .arrow-wrap,
+      .panel:fullscreen .arrow-wrap,
+      .panel:-webkit-full-screen .arrow-wrap {
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      .panel.is-fullscreen .arrow,
+      .panel:fullscreen .arrow,
+      .panel:-webkit-full-screen .arrow {
+        width: min(90vw, 560px);
+        height: min(110vw, 680px);
+      }
+
+      .panel.is-fullscreen .reached-mark,
+      .panel:fullscreen .reached-mark,
+      .panel:-webkit-full-screen .reached-mark {
+        width: min(56vw, 220px);
+        height: min(56vw, 220px);
+        font-size: min(28vw, 96px);
+      }
+
+      .panel.is-fullscreen .distance-value,
+      .panel:fullscreen .distance-value,
+      .panel:-webkit-full-screen .distance-value {
+        color: #111 !important;
+        -webkit-text-fill-color: #111;
+        font-size: 64px;
+      }
+
+      .panel.is-fullscreen .distance-block,
+      .panel:fullscreen .distance-block,
+      .panel:-webkit-full-screen .distance-block {
+        color: #111;
+      }
+
+      .panel.is-fullscreen .status,
+      .panel:fullscreen .status,
+      .panel:-webkit-full-screen .status {
+        color: #444 !important;
+      }
+
+      .panel.is-fullscreen .tolerance-row,
+      .panel:fullscreen .tolerance-row,
+      .panel:-webkit-full-screen .tolerance-row {
+        color: #555 !important;
+      }
+
+      .panel.is-fullscreen .tolerance-row input,
+      .panel:fullscreen .tolerance-row input,
+      .panel:-webkit-full-screen .tolerance-row input {
+        color: #222 !important;
+        background: #fff !important;
+      }
     </style>
   </head>
   <body>
-    <div class="panel">
+    <div class="panel" id="nav-panel">
+      <div class="compass-row">
+        <button id="enable-compass" class="compass-btn" type="button">
+          Enable compass
+        </button>
+        <button
+          id="fullscreen-btn"
+          class="fullscreen-btn"
+          type="button"
+          title="Expand the navigation arrow"
+        >
+          Fullscreen
+        </button>
+      </div>
+      <div id="rtk-bar" class="rtk-bar unknown" role="status" aria-live="polite">
+        Waiting for GPS…
+      </div>
       <div class="arrow-wrap" title="Direction to target relative to the way you are facing">
         <div id="nav-arrow" class="arrow disabled">
           <svg
@@ -1608,7 +1807,7 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       </div>
       <div class="distance-block">
         <div id="distance-value" class="distance-value">--</div>
-        <div id="status-line" class="status">Enable the compass on the map below. Position comes from the RTK receiver.</div>
+        <div id="status-line" class="status">Tap Enable compass above, then follow the arrow. Position comes from the RTK receiver.</div>
       </div>
       <div class="tolerance-row">
         <label for="tolerance-cm">Reach tolerance</label>
@@ -1625,10 +1824,20 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
     <script>
       const NAV_MESSAGE_TYPE = "gps-stick-nav";
       const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
 
       // Cumulative CSS angle so 359°→0° takes the short path instead of
       // spinning ~359° the long way around (0 and 360 are the same heading).
       let arrowRotCum = null;
+      let compassEnabled = false;
+      let hasAbsoluteHeading = false;
+      let headingSin = null;
+      let headingCos = null;
+      let headingFilterReady = false;
+      let headingPublishTimer = null;
+      let orientationEventSeen = false;
+      const HEADING_SMOOTHING = 0.35;
+      const HEADING_PUBLISH_MS = 100;
 
       function setArrowRotation(degrees) {
         const arrow = document.getElementById("nav-arrow");
@@ -1674,7 +1883,197 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         }
       }
 
+      function publishHeading(heading) {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+            channel.postMessage({ heading: Number(heading) });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function requestMapEnableCompass() {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+            channel.postMessage({ action: "enableCompass" });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function extractHeading(event) {
+        if (
+          event.webkitCompassHeading != null &&
+          Number.isFinite(event.webkitCompassHeading)
+        ) {
+          return { heading: event.webkitCompassHeading, absolute: true };
+        }
+        if (event.alpha != null && Number.isFinite(event.alpha)) {
+          const absolute =
+            event.absolute === true || event.type === "deviceorientationabsolute";
+          return { heading: (360 - event.alpha) % 360, absolute };
+        }
+        return null;
+      }
+
+      function getSmoothedHeading() {
+        if (!headingFilterReady) {
+          return null;
+        }
+        return (
+          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360
+        );
+      }
+
+      function onDeviceOrientation(event) {
+        orientationEventSeen = true;
+        const reading = extractHeading(event);
+        if (reading == null) {
+          return;
+        }
+        if (reading.absolute) {
+          hasAbsoluteHeading = true;
+        } else if (hasAbsoluteHeading) {
+          return;
+        }
+        const rad = (reading.heading * Math.PI) / 180;
+        if (headingSin == null) {
+          headingSin = Math.sin(rad);
+          headingCos = Math.cos(rad);
+        } else {
+          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
+          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
+        }
+        headingFilterReady = true;
+      }
+
+      function startHeadingPublish() {
+        if (headingPublishTimer != null) {
+          return;
+        }
+        headingPublishTimer = setInterval(() => {
+          const heading = getSmoothedHeading();
+          if (heading == null) {
+            return;
+          }
+          publishHeading(heading);
+        }, HEADING_PUBLISH_MS);
+      }
+
+      async function requestOrientationPermission() {
+        if (
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+        ) {
+          const response = await DeviceOrientationEvent.requestPermission();
+          return response === "granted";
+        }
+        return true;
+      }
+
+      async function enableCompass() {
+        const button = document.getElementById("enable-compass");
+        const statusLine = document.getElementById("status-line");
+        try {
+          const granted = await requestOrientationPermission();
+          if (!granted) {
+            if (statusLine) {
+              statusLine.textContent =
+                "Compass permission denied. Distance still works without facing direction.";
+              statusLine.className = "status warn";
+            }
+            return;
+          }
+        } catch (error) {
+          // Continue; some browsers fire orientation without an explicit grant.
+        }
+
+        if ("ondeviceorientationabsolute" in window) {
+          window.addEventListener(
+            "deviceorientationabsolute",
+            onDeviceOrientation,
+            true
+          );
+        }
+        window.addEventListener("deviceorientation", onDeviceOrientation, true);
+        startHeadingPublish();
+        // Also ask the map iframe to enable its own sensors (cone / follow).
+        requestMapEnableCompass();
+
+        compassEnabled = true;
+        if (button) {
+          button.textContent = "Compass enabled";
+          button.classList.add("enabled");
+          button.disabled = true;
+        }
+        if (statusLine && statusLine.className.indexOf("success") < 0) {
+          statusLine.textContent =
+            "Compass enabled. Follow the arrow toward the nearest grid point.";
+          statusLine.className = "status";
+        }
+
+        setTimeout(() => {
+          if (!orientationEventSeen && statusLine) {
+            statusLine.textContent =
+              "No compass data is coming from this device. Distance still works.";
+            statusLine.className = "status warn";
+          }
+        }, 4000);
+      }
+
+      function updateRtkBar(payload) {
+        const bar = document.getElementById("rtk-bar");
+        if (!bar) {
+          return;
+        }
+        if (payload.rtk_label == null && payload.gps_qual == null) {
+          return;
+        }
+        let label = payload.rtk_label;
+        let cssClass = payload.rtk_class || "unknown";
+        if (!label) {
+          const qual = Number(payload.gps_qual);
+          if (qual === 4) {
+            label = "RTK Fix";
+            cssClass = "fix";
+          } else if (qual === 5) {
+            label = "RTK Float";
+            cssClass = "float";
+          } else if (Number.isFinite(qual)) {
+            label = "No RTK";
+            cssClass = "none";
+          } else {
+            label = "Waiting for GPS…";
+            cssClass = "unknown";
+          }
+        }
+        const sats = Number(payload.num_sats);
+        const satsNote =
+          Number.isFinite(sats) && sats > 0 ? ` · ${sats} sats` : "";
+        bar.textContent = `${label}${satsNote}`;
+        bar.className = `rtk-bar ${cssClass}`;
+      }
+
       function updatePanel(payload) {
+        updateRtkBar(payload);
+
+        // Quality-only updates from Python skip the distance/arrow path.
+        if (
+          payload.distance === undefined &&
+          payload.relative_bearing === undefined &&
+          payload.reached === undefined &&
+          payload.sensorIssue === undefined &&
+          (payload.rtk_label != null || payload.gps_qual != null)
+        ) {
+          return;
+        }
+
         const distanceValue = document.getElementById("distance-value");
         const statusLine = document.getElementById("status-line");
         const arrow = document.getElementById("nav-arrow");
@@ -1728,6 +2127,12 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
           statusLine.textContent =
             "Waiting for RTK position and an active grid target.";
           statusLine.className = "status warn";
+        } else if (!compassEnabled) {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent =
+            "Tap Enable compass above for facing direction.";
+          statusLine.className = "status warn";
         } else {
           arrow.classList.add("disabled");
           setArrowRotation(null);
@@ -1747,6 +2152,87 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       toleranceInput.addEventListener("input", publishTolerance);
       publishTolerance();
 
+      function isNativeFullscreen() {
+        return !!(
+          document.fullscreenElement ||
+          document.webkitFullscreenElement ||
+          document.msFullscreenElement
+        );
+      }
+
+      function updateFullscreenButton() {
+        const button = document.getElementById("fullscreen-btn");
+        const panel = document.getElementById("nav-panel");
+        if (!button || !panel) {
+          return;
+        }
+        const active = isNativeFullscreen() || panel.classList.contains("is-fullscreen");
+        button.textContent = active ? "Exit fullscreen" : "Fullscreen";
+      }
+
+      async function toggleFullscreen() {
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return;
+        }
+
+        const active =
+          isNativeFullscreen() || panel.classList.contains("is-fullscreen");
+
+        // Prefer the browser Fullscreen API so the arrow can fill the phone.
+        // Always keep .is-fullscreen in sync so light background + larger arrow
+        // CSS apply even when the browser paints a dark fullscreen chrome.
+        if (active) {
+          try {
+            if (isNativeFullscreen()) {
+              const exit =
+                document.exitFullscreen ||
+                document.webkitExitFullscreen ||
+                document.msExitFullscreen;
+              if (exit) {
+                await exit.call(document);
+              }
+            }
+          } catch (error) {
+            // Ignore API failures; CSS class below still exits the fallback.
+          }
+          panel.classList.remove("is-fullscreen");
+        } else {
+          try {
+            const request =
+              panel.requestFullscreen ||
+              panel.webkitRequestFullscreen ||
+              panel.msRequestFullscreen;
+            if (request) {
+              await request.call(panel);
+            }
+          } catch (error) {
+            // Fall through to CSS-only fullscreen inside the iframe.
+          }
+          panel.classList.add("is-fullscreen");
+        }
+        updateFullscreenButton();
+      }
+
+      function onFullscreenChange() {
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return;
+        }
+        if (isNativeFullscreen()) {
+          panel.classList.add("is-fullscreen");
+        } else {
+          panel.classList.remove("is-fullscreen");
+        }
+        updateFullscreenButton();
+      }
+
+      document
+        .getElementById("fullscreen-btn")
+        .addEventListener("click", toggleFullscreen);
+      document.addEventListener("fullscreenchange", onFullscreenChange);
+      document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+
       try {
         if (typeof BroadcastChannel !== "undefined") {
           const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
@@ -1758,16 +2244,27 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         // Ignore channel errors on older browsers.
       }
 
-      (function showSensorWarningOnLoad() {
+      (function initCompassUi() {
+        const button = document.getElementById("enable-compass");
+        const ua = navigator.userAgent || "";
+        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
+        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
+        const desktop = !mobile && !hasTouch;
+
         if (!window.isSecureContext) {
           updatePanel({ sensorIssue: "insecure" });
           return;
         }
-        const ua = navigator.userAgent || "";
-        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
-        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
-        if (!mobile && !hasTouch) {
+        if (desktop) {
+          // No device compass on desktop — hide the control entirely.
+          if (button) {
+            button.style.display = "none";
+          }
           updatePanel({ sensorIssue: "desktop" });
+          return;
+        }
+        if (button) {
+          button.addEventListener("click", enableCompass);
         }
       })();
     </script>
@@ -1830,10 +2327,10 @@ def post_user_position_update(user_lat, user_lon, session_key):
 
 
 def post_endless_grid_window_if_needed(user_lat, user_lon):
-    """When endless mode is active, slide the visible lattice window with the user."""
+    """Show only the closest infinite-lattice point in the live field view."""
     if not st.session_state.get("grid_finalized"):
         return
-    if not st.session_state.get("grid_endless", False):
+    if not st.session_state.get("grid_endless", True):
         return
     df, center = build_active_grid_df(
         user_lat,
@@ -1862,6 +2359,34 @@ def _iter_nmea_sentences(line):
     for part in line.lstrip("$").split("$"):
         if part:
             yield "$" + part
+
+
+_COMPLETE_NMEA_RE = re.compile(
+    r"\$[A-Z0-9]{5},[^$\r\n]*\*[0-9A-Fa-f]{2}"
+)
+
+
+def _extract_complete_nmea_sentences(buffered):
+    """Extract checksum-complete NMEA sentences without requiring CR/LF.
+
+    Some high-rate receiver configurations expose a complete `$GNGGA...*HH`
+    packet through USB before its line terminator arrives. Completion is
+    unambiguous once the two checksum digits are present, so parse immediately
+    instead of waiting for a newline or the following `$`.
+    """
+    matches = list(_COMPLETE_NMEA_RE.finditer(buffered))
+    if matches:
+        sentences = [match.group(0) for match in matches]
+        remainder = buffered[matches[-1].end():].lstrip("\r\n")
+        return sentences, remainder[-8192:]
+
+    # Discard noise before the newest possible sentence start, but retain a
+    # partial sentence for completion by the next serial read.
+    last_start = buffered.rfind("$")
+    if last_start >= 0:
+        buffered = buffered[last_start:]
+    return [], buffered[-8192:]
+
 
 def _parse_gga_sentence(sentence):
     if not (sentence.startswith("$GNGGA") or sentence.startswith("$GPGGA")):
@@ -1902,9 +2427,22 @@ def latest_gps_fix():
         st.session_state.last_gps_lat_lon = coords
     return coords
 
+def _resolve_gps_serial_port():
+    """Return configured port, or the available ttyACM device after USB renumbering."""
+    configured = Path(SERIAL_PORT)
+    if configured.exists():
+        return str(configured)
+
+    # Linux may change ttyACM0 to ttyACM1 after a receiver reset/replug.
+    candidates = sorted(Path("/dev").glob("ttyACM*"))
+    if candidates:
+        return str(candidates[0])
+    return SERIAL_PORT
+
+
 def _open_gps_serial_if_needed():
     """Return the shared GNSS serial handle, opening it if needed (thread-safe)."""
-    global _gps_serial
+    global _gps_serial, _gps_serial_port, _gps_serial_error
     with _gps_serial_lock:
         if _gps_serial is not None:
             try:
@@ -1912,13 +2450,18 @@ def _open_gps_serial_if_needed():
                     return _gps_serial
             except Exception:
                 pass
+        port = _resolve_gps_serial_port()
         try:
-            _gps_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+            _gps_serial = serial.Serial(port, BAUD_RATE, timeout=0.1)
             # Match ntrip-rover.py's flushInput()/flushOutput() on open.
             _gps_serial.reset_input_buffer()
             _gps_serial.reset_output_buffer()
-        except Exception:
+            _gps_serial_port = port
+            _gps_serial_error = None
+        except Exception as exc:
             _gps_serial = None
+            _gps_serial_port = port
+            _gps_serial_error = f"{port}: {exc}"
         return _gps_serial
 
 
@@ -1973,25 +2516,120 @@ def _write_rtcm_to_gps(data):
 
 
 def get_ntrip_status():
-    with _ntrip_lock:
-        return dict(_ntrip_status)
+    """Return a UI-facing snapshot of NTRIP state (includes live stream health)."""
+    # Revive the worker if a mountpoint is still wanted after a script reload.
+    with ntrip_rt.lock:
+        desired = ntrip_rt.desired
+    if desired:
+        _ensure_ntrip_thread()
+
+    with ntrip_rt.lock:
+        status = dict(ntrip_rt.status)
+        desired = dict(ntrip_rt.desired) if ntrip_rt.desired else None
+        thread = ntrip_rt.thread
+
+    last_rtcm_at = float(status.get("last_rtcm_at") or 0.0)
+    age_s = (time.time() - last_rtcm_at) if last_rtcm_at > 0 else None
+    active_key = ntrip_rt.target_key(desired)
+    mountpoint = (desired or {}).get("mountpoint") or status.get("mountpoint")
+    bytes_total = int(status.get("bytes_total") or 0)
+    thread_alive = thread is not None and thread.is_alive()
+    label = ntrip_rt.target_label(desired) if desired else None
+
+    if not desired:
+        status["state"] = "idle"
+        status["message"] = "Not connected"
+        status["mountpoint"] = None
+        status["host"] = None
+        status["port"] = None
+        status["source"] = None
+        status["desired_mountpoint"] = None
+        status["desired_key"] = None
+        status["desired"] = None
+        status["streaming"] = False
+        status["rtcm_age_s"] = age_s
+        return status
+
+    if (
+        age_s is not None
+        and age_s <= ntrip_rt.STREAM_STALE_S
+        and status.get("state") in ("connected", "connecting")
+    ):
+        kb = bytes_total / 1024.0
+        status["state"] = "connected"
+        status["message"] = f"Streaming RTCM from {label} · {kb:.1f} KB received"
+        status["streaming"] = True
+    elif status.get("state") == "connected":
+        status["message"] = (
+            f"Connected to {label}, waiting for RTCM…"
+            if age_s is None or age_s > ntrip_rt.STREAM_STALE_S
+            else status.get("message") or f"Connected to {label}"
+        )
+        status["streaming"] = False
+    elif status.get("state") == "idle" and desired:
+        # Desired target survived a reload but status looked idle — recover.
+        status["state"] = "connecting"
+        status["message"] = (
+            f"Reconnecting to {label}…"
+            if thread_alive
+            else f"Starting NTRIP for {label}…"
+        )
+        status["streaming"] = False
+    else:
+        status["streaming"] = False
+
+    status["rtcm_age_s"] = age_s
+    status["mountpoint"] = mountpoint
+    status["host"] = desired.get("host")
+    status["port"] = desired.get("port")
+    status["source"] = desired.get("source")
+    status["desired_mountpoint"] = mountpoint
+    status["desired_key"] = active_key
+    status["desired"] = desired
+    return status
 
 
-def _set_ntrip_status(state, message, mountpoint=None):
-    with _ntrip_lock:
-        _ntrip_status["state"] = state
-        _ntrip_status["message"] = message
-        if mountpoint is not None:
-            _ntrip_status["mountpoint"] = mountpoint
+def _set_ntrip_status(state, message, target=None):
+    with ntrip_rt.lock:
+        ntrip_rt.status["state"] = state
+        ntrip_rt.status["message"] = message
+        if target is not None:
+            ntrip_rt.status["mountpoint"] = target.get("mountpoint")
+            ntrip_rt.status["host"] = target.get("host")
+            ntrip_rt.status["port"] = target.get("port")
+            ntrip_rt.status["source"] = target.get("source")
 
 
-def _ntrip_request_headers(mountpoint):
-    # RTK2GO: email as username, password "none" (same as ntrip-rover.py).
-    credentials = f"{NTRIP_USER_EMAIL}:none"
-    encoded_creds = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+def _note_rtcm_received(nbytes):
+    """Record that RTCM bytes were successfully forwarded to the receiver."""
+    if nbytes <= 0:
+        return
+    with ntrip_rt.lock:
+        ntrip_rt.status["last_rtcm_at"] = time.time()
+        ntrip_rt.status["bytes_total"] = int(
+            ntrip_rt.status.get("bytes_total") or 0
+        ) + int(nbytes)
+        label = ntrip_rt.target_label(ntrip_rt.desired) or "caster"
+        kb = ntrip_rt.status["bytes_total"] / 1024.0
+        ntrip_rt.status["state"] = "connected"
+        ntrip_rt.status["message"] = (
+            f"Streaming RTCM from {label} · {kb:.1f} KB received"
+        )
+
+
+def _ntrip_request_headers(target):
+    """Build an NTRIP request for RTK2GO or a local caster."""
+    mountpoint = (target.get("mountpoint") or "").strip().lstrip("/")
+    username = target.get("username")
+    password = target.get("password")
     req = f"GET /{mountpoint} HTTP/1.0\r\n"
     req += "User-Agent: NTRIP PythonClient/1.0\r\n"
-    req += f"Authorization: Basic {encoded_creds}\r\n"
+    # RTK2GO always authenticates with email:none. Local casters often need
+    # no auth; only send Basic credentials when a username was provided.
+    if username not in (None, ""):
+        credentials = f"{username}:{password if password is not None else ''}"
+        encoded_creds = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+        req += f"Authorization: Basic {encoded_creds}\r\n"
     req += "Ntrip-Version: Ntrip/2.0\r\n"
     req += "Connection: close\r\n\r\n"
     return req.encode("utf-8")
@@ -2019,17 +2657,65 @@ def _read_ntrip_headers(sock):
     return header.decode("utf-8", errors="ignore"), body
 
 
-def _ntrip_stream_once(mountpoint, stop_event):
-    """Connect to one RTK2GO mountpoint and relay RTCM until stop or error."""
-    _set_ntrip_status("connecting", f"Connecting to {mountpoint}…", mountpoint)
+def _normalize_ntrip_target(
+    *,
+    mountpoint,
+    host=None,
+    port=None,
+    username=None,
+    password=None,
+    source="rtk2go",
+):
+    cleaned = (mountpoint or "").strip().lstrip("/")
+    if not cleaned:
+        raise ValueError("Mountpoint cannot be empty")
+    source = (source or "rtk2go").strip().lower()
+    if source not in ("rtk2go", "local"):
+        raise ValueError("Caster source must be 'rtk2go' or 'local'")
+
+    if source == "rtk2go":
+        host = NTRIP_HOST
+        port = NTRIP_PORT
+        username = NTRIP_USER_EMAIL
+        password = "none"
+    else:
+        host = (host or "").strip()
+        if not host:
+            raise ValueError("Local caster IP / hostname cannot be empty")
+        try:
+            port = int(port if port is not None else NTRIP_PORT)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Caster port must be an integer") from exc
+        if not (1 <= port <= 65535):
+            raise ValueError("Caster port must be between 1 and 65535")
+        username = (username or "").strip()
+        password = "" if password is None else str(password)
+
+    return {
+        "source": source,
+        "host": host,
+        "port": int(port),
+        "mountpoint": cleaned,
+        "username": username,
+        "password": password,
+    }
+
+
+def _ntrip_stream_once(target, stop_event):
+    """Connect to one caster target and relay RTCM until stop or error."""
+    label = ntrip_rt.target_label(target)
+    _set_ntrip_status("connecting", f"Connecting to {label}…", target)
     if _open_gps_serial_if_needed() is None:
-        raise RuntimeError(f"Cannot open GNSS serial port {SERIAL_PORT}")
+        raise RuntimeError(
+            f"Cannot open GNSS serial port {_gps_serial_port}: "
+            f"{_gps_serial_error or 'unknown error'}"
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(15.0)
     try:
-        sock.connect((NTRIP_HOST, NTRIP_PORT))
-        sock.sendall(_ntrip_request_headers(mountpoint))
+        sock.connect((target["host"], int(target["port"])))
+        sock.sendall(_ntrip_request_headers(target))
         response, leftover = _read_ntrip_headers(sock)
         if not (
             "ICY 200 OK" in response
@@ -2040,11 +2726,13 @@ def _ntrip_stream_once(mountpoint, stop_event):
 
         _set_ntrip_status(
             "connected",
-            f"Streaming RTCM from {mountpoint}",
-            mountpoint,
+            f"Connected to {label}, waiting for RTCM…",
+            target,
         )
-        if leftover and not _write_rtcm_to_gps(leftover):
-            raise RuntimeError("GNSS serial port write failed")
+        if leftover:
+            if not _write_rtcm_to_gps(leftover):
+                raise RuntimeError("GNSS serial port write failed")
+            _note_rtcm_received(len(leftover))
 
         sock.settimeout(5.0)
         last_gga_upload = 0.0
@@ -2070,9 +2758,9 @@ def _ntrip_stream_once(mountpoint, stop_event):
         upload_gga_if_due(force=True)
 
         while not stop_event.is_set():
-            with _ntrip_lock:
-                desired = _ntrip_desired_mountpoint
-            if desired != mountpoint:
+            with ntrip_rt.lock:
+                desired = ntrip_rt.desired
+            if desired != target:
                 break
             upload_gga_if_due()
             try:
@@ -2083,6 +2771,7 @@ def _ntrip_stream_once(mountpoint, stop_event):
                 raise RuntimeError("Connection closed by caster")
             if not _write_rtcm_to_gps(data):
                 raise RuntimeError("GNSS serial port write failed")
+            _note_rtcm_received(len(data))
     finally:
         try:
             sock.close()
@@ -2091,77 +2780,101 @@ def _ntrip_stream_once(mountpoint, stop_event):
 
 
 def _ntrip_worker():
-    """Background loop: keep streaming the selected mountpoint, reconnecting on errors."""
+    """Background loop: keep streaming the selected target, reconnecting on errors."""
     delay = 5
-    while not _ntrip_stop.is_set():
-        with _ntrip_lock:
-            mountpoint = _ntrip_desired_mountpoint
-        if not mountpoint:
+    while not ntrip_rt.stop.is_set():
+        with ntrip_rt.lock:
+            target = dict(ntrip_rt.desired) if ntrip_rt.desired else None
+        if not target:
             _set_ntrip_status("idle", "Not connected", None)
             time.sleep(0.4)
             continue
         try:
-            _ntrip_stream_once(mountpoint, _ntrip_stop)
+            _ntrip_stream_once(target, ntrip_rt.stop)
+            delay = 5
         except Exception as exc:
-            with _ntrip_lock:
-                still_wanted = _ntrip_desired_mountpoint == mountpoint
-            if still_wanted and not _ntrip_stop.is_set():
+            with ntrip_rt.lock:
+                still_wanted = ntrip_rt.desired == target
+            if still_wanted and not ntrip_rt.stop.is_set():
                 delay = min(delay * 2, 300)
+                label = ntrip_rt.target_label(target)
                 _set_ntrip_status(
                     "error",
                     f"{exc}. Reconnecting in {delay}s…",
-                    mountpoint,
+                    target,
                 )
                 # Interruptible wait so Disconnect is responsive.
                 for _ in range(int(delay * 10)):
-                    if _ntrip_stop.is_set():
+                    if ntrip_rt.stop.is_set():
                         break
-                    with _ntrip_lock:
-                        if _ntrip_desired_mountpoint != mountpoint:
+                    with ntrip_rt.lock:
+                        if ntrip_rt.desired != target:
                             break
                     time.sleep(0.1)
 
 
 def _ensure_ntrip_thread():
-    global _ntrip_thread
-    with _ntrip_lock:
-        if _ntrip_thread is not None and _ntrip_thread.is_alive():
+    with ntrip_rt.lock:
+        if ntrip_rt.thread is not None and ntrip_rt.thread.is_alive():
             return
-        _ntrip_stop.clear()
-        _ntrip_thread = threading.Thread(
+        ntrip_rt.stop.clear()
+        ntrip_rt.thread = threading.Thread(
             target=_ntrip_worker,
             name="ntrip-rtcm",
             daemon=True,
         )
-        _ntrip_thread.start()
+        ntrip_rt.thread.start()
 
 
-def start_ntrip(mountpoint):
-    """Start (or switch) RTK2GO streaming for the given mountpoint."""
-    global _ntrip_desired_mountpoint
-    cleaned = (mountpoint or "").strip().lstrip("/")
-    if not cleaned:
-        raise ValueError("Mountpoint cannot be empty")
+def start_ntrip(
+    mountpoint,
+    *,
+    host=None,
+    port=None,
+    username=None,
+    password=None,
+    source="rtk2go",
+):
+    """Start (or switch) NTRIP streaming for the given caster target."""
+    target = _normalize_ntrip_target(
+        mountpoint=mountpoint,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        source=source,
+    )
     _ensure_ntrip_thread()
-    with _ntrip_lock:
-        _ntrip_desired_mountpoint = cleaned
-    _set_ntrip_status("connecting", f"Connecting to {cleaned}…", cleaned)
+    with ntrip_rt.lock:
+        ntrip_rt.desired = target
+        ntrip_rt.status["bytes_total"] = 0
+        ntrip_rt.status["last_rtcm_at"] = 0.0
+    _set_ntrip_status(
+        "connecting",
+        f"Connecting to {ntrip_rt.target_label(target)}…",
+        target,
+    )
 
 
 def stop_ntrip():
     """Stop streaming corrections (worker thread stays idle for a later connect)."""
-    global _ntrip_desired_mountpoint
-    with _ntrip_lock:
-        _ntrip_desired_mountpoint = None
+    with ntrip_rt.lock:
+        ntrip_rt.desired = None
+        ntrip_rt.status["last_rtcm_at"] = 0.0
+        ntrip_rt.status["bytes_total"] = 0
+        ntrip_rt.status["host"] = None
+        ntrip_rt.status["port"] = None
+        ntrip_rt.status["source"] = None
+        ntrip_rt.status["mountpoint"] = None
     _set_ntrip_status("idle", "Not connected", None)
 
 
 def poll_gps(timeout_s=0.15):
     """Read buffered serial data and return the latest valid GGA fix.
 
-    Designed to be cheap on every Streamlit rerun/fragment tick: if a fix is
-    already cached and the port has nothing waiting, return immediately.
-    Never busy-spins the CPU while waiting for the first fix.
+    Drain every byte currently waiting so high-rate NMEA output cannot build a
+    backlog. Reading one line per pass can leave the displayed GGA several
+    sentences behind when the receiver also emits GSA/GSV/RMC messages.
     """
     _ensure_gps_serial()
     ser = st.session_state.get("gps_serial")
@@ -2169,9 +2882,11 @@ def poll_gps(timeout_s=0.15):
         return st.session_state.get("last_gps_msg")
 
     deadline = time.time() + max(0.0, float(timeout_s))
+    if "gps_rx_buffer" not in st.session_state:
+        st.session_state.gps_rx_buffer = ""
 
     while True:
-        line = None
+        lines = []
         waiting = 0
         # Only serialize NMEA readers against each other; RTCM writes run
         # concurrently on the same full-duplex fd and must never wait here.
@@ -2183,9 +2898,15 @@ def poll_gps(timeout_s=0.15):
 
             if waiting > 0:
                 try:
-                    line = ser.readline().decode("ascii", errors="replace").strip()
+                    # read(waiting) is non-blocking here and drains the backlog
+                    # in one syscall instead of consuming one NMEA line at a time.
+                    chunk = ser.read(waiting).decode("ascii", errors="replace")
                 except Exception:
                     break
+                buffered = st.session_state.gps_rx_buffer + chunk
+                lines, st.session_state.gps_rx_buffer = (
+                    _extract_complete_nmea_sentences(buffered)
+                )
 
         if waiting <= 0:
             if st.session_state.get("last_gps_msg") is not None:
@@ -2195,8 +2916,8 @@ def poll_gps(timeout_s=0.15):
             time.sleep(0.02)
             continue
 
-        if line:
-            for sentence in _iter_nmea_sentences(line):
+        for line in lines:
+            for sentence in _iter_nmea_sentences(line.strip()):
                 msg = _parse_gga_sentence(sentence)
                 coords = _gga_lat_lon(msg)
                 if coords is not None:
@@ -2204,6 +2925,7 @@ def poll_gps(timeout_s=0.15):
                     st.session_state.last_gps_lat_lon = coords
                     # Feed the NTRIP thread the rover position to report upstream.
                     _set_latest_gga(sentence)
+                    _set_latest_gps_quality(msg)
 
         if time.time() >= deadline:
             break
@@ -2324,7 +3046,7 @@ def save_grid_to_file(name):
         "cols": int(st.session_state.grid_dim_e),
         "spacing_m": float(st.session_state.grid_spacing),
         "staggered": bool(st.session_state.get("grid_staggered", True)),
-        "endless": bool(st.session_state.get("grid_endless", False)),
+        "endless": bool(st.session_state.get("grid_endless", True)),
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     file_path = GRID_SAVE_DIR / f"{safe_name}.json"
@@ -2412,7 +3134,12 @@ if coords is None:
     poll_gps(timeout_s=1.0)
     coords = latest_gps_fix()
 if coords is None:
-    st.warning("Waiting for a valid GPS fix from the receiver...")
+    if _gps_serial_error:
+        st.error(f"Cannot read GPS serial port: {_gps_serial_error}")
+    else:
+        st.warning(
+            f"Waiting for a valid GPS fix from the receiver on {_gps_serial_port}..."
+        )
     time.sleep(0.5)
     st.rerun()
 
@@ -2423,32 +3150,191 @@ apply_pending_saved_grid_choice()
 
 
 with st.sidebar:
-    st.header("NTRIP (RTK2GO)")
+    st.header("NTRIP")
 
-    @st.fragment(run_every=2.0)
+    @st.fragment(run_every=1.0)
     def render_ntrip_controls():
+        status = get_ntrip_status()
+        active = status.get("desired")
+        active_key = status.get("desired_key")
+
+        if "ntrip_source" not in st.session_state:
+            st.session_state.ntrip_source = (
+                "Local base"
+                if (active or {}).get("source") == "local"
+                else "RTK2GO"
+            )
         if "ntrip_mountpoint_input" not in st.session_state:
-            st.session_state.ntrip_mountpoint_input = NTRIP_DEFAULT_MOUNTPOINT
+            st.session_state.ntrip_mountpoint_input = (
+                (active or {}).get("mountpoint") or NTRIP_DEFAULT_MOUNTPOINT
+            )
+        if "ntrip_local_host" not in st.session_state:
+            st.session_state.ntrip_local_host = (
+                ((active or {}).get("host") or "")
+                if (active or {}).get("source") == "local"
+                else ""
+            )
+        if "ntrip_local_port" not in st.session_state:
+            st.session_state.ntrip_local_port = int(
+                (active or {}).get("port") or NTRIP_PORT
+            )
+        if "ntrip_local_user" not in st.session_state:
+            st.session_state.ntrip_local_user = (
+                ((active or {}).get("username") or "")
+                if (active or {}).get("source") == "local"
+                else ""
+            )
+        if "ntrip_local_pass" not in st.session_state:
+            st.session_state.ntrip_local_pass = (
+                ((active or {}).get("password") or "")
+                if (active or {}).get("source") == "local"
+                else ""
+            )
+
+        source_label = st.radio(
+            "Caster source",
+            ["RTK2GO", "Local base"],
+            key="ntrip_source",
+            horizontal=True,
+            help=(
+                "RTK2GO uses the public caster. Local base connects directly to "
+                "an NTRIP caster on your LAN by IP address."
+            ),
+        )
+        source = "local" if source_label == "Local base" else "rtk2go"
+
+        if source == "local":
+            host = st.text_input(
+                "Caster IP / hostname",
+                key="ntrip_local_host",
+                placeholder="192.168.1.50",
+                help="Local NTRIP caster address (your base station or LAN caster).",
+            )
+            port = st.number_input(
+                "Port",
+                min_value=1,
+                max_value=65535,
+                step=1,
+                key="ntrip_local_port",
+            )
+            username = st.text_input(
+                "Username (optional)",
+                key="ntrip_local_user",
+                help="Leave blank if your local caster does not require auth.",
+            )
+            password = st.text_input(
+                "Password (optional)",
+                type="password",
+                key="ntrip_local_pass",
+            )
+            mount_help = "Mountpoint advertised by your local caster."
+        else:
+            host = NTRIP_HOST
+            port = NTRIP_PORT
+            username = NTRIP_USER_EMAIL
+            password = "none"
+            mount_help = f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}"
+
         mountpoint = st.text_input(
             "Mountpoint",
             key="ntrip_mountpoint_input",
-            help=f"RTK2GO caster mountpoint on {NTRIP_HOST}:{NTRIP_PORT}"
+            help=mount_help,
         )
+
+        try:
+            requested_target = _normalize_ntrip_target(
+                mountpoint=mountpoint,
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                source=source,
+            )
+            requested_key = ntrip_rt.target_key(requested_target)
+        except ValueError:
+            requested_target = None
+            requested_key = None
+
+        pending_switch = st.session_state.get("ntrip_pending_switch")
+
+        if active_key:
+            st.info(
+                f"This Pi is already streaming from **{active_key}**. "
+                "All connected devices share that single NTRIP session."
+            )
+
         col_connect, col_disconnect = st.columns(2)
         with col_connect:
-            if st.button("Connect", use_container_width=True, type="primary"):
+            connect_label = "Connect"
+            if active_key and requested_key and requested_key != active_key:
+                connect_label = "Switch station…"
+            elif active_key and requested_key == active_key:
+                connect_label = "Reconnect"
+            if st.button(connect_label, use_container_width=True, type="primary"):
                 try:
-                    start_ntrip(mountpoint)
+                    if requested_target is None:
+                        # Re-validate to surface a clear error message.
+                        requested_target = _normalize_ntrip_target(
+                            mountpoint=mountpoint,
+                            host=host,
+                            port=port,
+                            username=username,
+                            password=password,
+                            source=source,
+                        )
+                        requested_key = ntrip_rt.target_key(requested_target)
+                    if active_key and requested_key != active_key:
+                        # Ask before tearing down the shared stream for everyone.
+                        st.session_state.ntrip_pending_switch = requested_target
+                        st.rerun(scope="fragment")
+                    st.session_state.pop("ntrip_pending_switch", None)
+                    start_ntrip(
+                        requested_target["mountpoint"],
+                        host=requested_target["host"],
+                        port=requested_target["port"],
+                        username=requested_target["username"],
+                        password=requested_target["password"],
+                        source=requested_target["source"],
+                    )
                 except ValueError as exc:
                     st.error(str(exc))
         with col_disconnect:
             if st.button("Disconnect", use_container_width=True):
+                st.session_state.pop("ntrip_pending_switch", None)
                 stop_ntrip()
 
-        status = get_ntrip_status()
+        pending_key = ntrip_rt.target_key(pending_switch) if pending_switch else None
+        if pending_key and active_key and pending_key != active_key:
+            st.warning(
+                f"Switch the shared stream from **{active_key}** to "
+                f"**{pending_key}**? This changes the caster for every "
+                "device using this Pi."
+            )
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("Yes, switch", use_container_width=True, type="primary"):
+                    try:
+                        start_ntrip(
+                            pending_switch["mountpoint"],
+                            host=pending_switch["host"],
+                            port=pending_switch["port"],
+                            username=pending_switch["username"],
+                            password=pending_switch["password"],
+                            source=pending_switch["source"],
+                        )
+                        st.session_state.pop("ntrip_pending_switch", None)
+                        st.rerun(scope="fragment")
+                    except ValueError as exc:
+                        st.error(str(exc))
+            with col_no:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.pop("ntrip_pending_switch", None)
+                    st.rerun(scope="fragment")
+
         state = status.get("state", "idle")
         message = status.get("message", "")
-        if state == "connected":
+        streaming = bool(status.get("streaming"))
+        if streaming or state == "connected":
             st.success(message)
         elif state == "connecting":
             st.info(message)
@@ -2456,7 +3342,13 @@ with st.sidebar:
             st.warning(message)
         else:
             st.caption(message)
-        st.caption(f"Caster: {NTRIP_HOST}:{NTRIP_PORT} · user: {NTRIP_USER_EMAIL}")
+
+        if source == "local":
+            st.caption("Local caster · auth only sent when a username is set")
+        else:
+            st.caption(
+                f"Caster: {NTRIP_HOST}:{NTRIP_PORT} · user: {NTRIP_USER_EMAIL}"
+            )
 
     render_ntrip_controls()
 
@@ -2465,15 +3357,15 @@ with st.sidebar:
     @st.fragment
     def render_grid_settings(current_lat, current_lon):
         if "grid_endless" not in st.session_state:
-            st.session_state.grid_endless = False
+            st.session_state.grid_endless = True
         if "grid_staggered" not in st.session_state:
             st.session_state.grid_staggered = True
         endless = st.checkbox(
             "Endless grid",
             key="grid_endless",
             help=(
-                "Infinite lattice locked at finalize. Rows/Columns control how many "
-                "spacings to draw around you as you walk."
+                "Infinite lattice locked at finalize. The live field view displays "
+                "only the lattice point closest to your current position."
             ),
         )
         staggered = st.checkbox(
@@ -2490,8 +3382,9 @@ with st.sidebar:
         )
         if endless:
             st.caption(
-                "Endless mode draws lattice points within the extent around your "
-                "position. Origin and orientation stay fixed after finalize."
+                "Rows/Columns set the placement-preview extent. After finalize, "
+                "the live field view shows only your closest lattice point. "
+                "Origin and orientation remain fixed."
             )
 
         if not st.session_state.get("grid_finalized"):
@@ -2633,7 +3526,7 @@ if not st.session_state.grid_finalized:
             view_seq=st.session_state.placement_view_seq,
             bearing=float(st.session_state.get("preview_orientation_deg", 0.0)),
             staggered=bool(st.session_state.get("grid_staggered", True)),
-            endless=bool(st.session_state.get("grid_endless", False)),
+            endless=bool(st.session_state.get("grid_endless", True)),
         )
         # The component reports the map center after every pan/zoom/rotate.
         # Ignore values tagged with an old view_seq: they predate a "Reset
@@ -2648,12 +3541,19 @@ if not st.session_state.grid_finalized:
             if map_state.get("bearing") is not None:
                 bearing = float(map_state["bearing"]) % 360.0
                 st.session_state.preview_orientation_deg = bearing
-                # Don't write the sidebar widget key from this fragment — stage it.
-                queue_grid_heading_input(bearing)
+                # Sidebar Grid heading lives in another fragment; stage the
+                # value and remount the page so the number_input picks it up.
+                widget_heading = st.session_state.get("grid_heading_input")
+                needs_sidebar_sync = widget_heading is None or (
+                    abs(_heading_delta_deg(float(widget_heading), bearing)) > 0.05
+                )
+                if needs_sidebar_sync:
+                    queue_grid_heading_input(bearing)
+                    st.rerun(scope="app")
 
     placement_map_fragment(current_lat, current_lon)
 
-    @st.fragment(run_every=0.5)
+    @st.fragment(run_every=0.25)
     def refresh_placement_user_marker():
         poll_gps(timeout_s=0.1)
         coords = latest_gps_fix()
@@ -2687,6 +3587,34 @@ if not st.session_state.grid_finalized:
 
 else:
     df = st.session_state.grid_df
+
+    flash = st.session_state.pop("grid_save_flash", None)
+    if flash:
+        st.success(flash)
+
+    grid_points = grid_df_to_points(df)
+
+    st.subheader("Live Navigation")
+
+    @st.fragment(run_every=0.25)
+    def refresh_live_user_marker():
+        poll_gps(timeout_s=0.1)
+        coords = latest_gps_fix()
+        post_rtk_status_update()
+        if coords is None:
+            return
+        post_user_position_update(
+            coords[0],
+            coords[1],
+            "live_user_pos",
+        )
+        post_endless_grid_window_if_needed(coords[0], coords[1])
+
+    refresh_live_user_marker()
+
+    if not st.session_state.get("live_nav_panel_mounted"):
+        render_live_nav_panel(height=520)
+        st.session_state.live_nav_panel_mounted = True
 
     col_adjust, col_save = st.columns(2)
     with col_adjust:
@@ -2749,26 +3677,9 @@ else:
 
         render_grid_save_controls()
 
-    flash = st.session_state.pop("grid_save_flash", None)
-    if flash:
-        st.success(flash)
-
-    grid_points = grid_df_to_points(df)
-
-    st.subheader("Live Navigation")
-    st.caption(
-        "Follow the large arrow — it points toward the nearest active grid point "
-        "relative to the way you are facing. Open **Enable compass** on the field map "
-        "below if prompted. Tap a blue grid point to skip it (yellow); tap again to "
-        "include it."
-    )
-    if not st.session_state.get("live_nav_panel_mounted"):
-        render_live_nav_panel(height=460)
-        st.session_state.live_nav_panel_mounted = True
-
     st.markdown("##### Field map")
     st.caption(
-        "Secondary map for compass permission, skip-toggles, and context. "
+        "Secondary map for skip-toggles and context. "
         "Compass-follow rotates the view while grid points stay locked to the ground."
     )
     if not st.session_state.get("live_map_mounted"):
@@ -2782,26 +3693,3 @@ else:
             height=260,
         )
         st.session_state.live_map_mounted = True
-
-    @st.fragment(run_every=0.5)
-    def refresh_live_user_marker():
-        msg = poll_gps(timeout_s=0.1)
-        coords = latest_gps_fix()
-        if coords is None:
-            return
-        if msg is not None:
-            try:
-                if int(msg.gps_qual) in [0, 1]:
-                    st.warning(
-                        "RTK fix quality is low. Please check your base station connection."
-                    )
-            except (TypeError, ValueError, AttributeError):
-                pass
-        post_user_position_update(
-            coords[0],
-            coords[1],
-            "live_user_pos",
-        )
-        post_endless_grid_window_if_needed(coords[0], coords[1])
-
-    refresh_live_user_marker()

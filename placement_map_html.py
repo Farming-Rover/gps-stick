@@ -95,16 +95,16 @@ def _encode_payload(payload: dict) -> str:
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
 
-def post_map_message(payload: dict) -> None:
-    """Send a lightweight update to the mounted map iframe without remounting it."""
+def post_broadcast_message(channel_type: str, payload: dict) -> None:
+    """Send a lightweight update over BroadcastChannel / postMessage."""
     # The nonce makes each messenger render unique. Without it, Streamlit sees
     # identical iframe HTML on repeated sends (e.g. pressing the same button
-    # twice), skips remounting it, and the message never fires. The map-side
-    # handlers ignore the extra key.
+    # twice), skips remounting it, and the message never fires. Receivers
+    # ignore the extra key.
     message_b64 = _encode_payload(
-        {"type": MAP_MESSAGE_TYPE, "_nonce": time.time_ns(), **payload}
+        {"type": channel_type, "_nonce": time.time_ns(), **payload}
     )
-    channel_name = json.dumps(MAP_MESSAGE_TYPE)
+    channel_name = json.dumps(channel_type)
     render_html_embed(
         f"""
         <div data-msg-b64="{message_b64}" id="gps-stick-msg" hidden></div>
@@ -134,6 +134,11 @@ def post_map_message(payload: dict) -> None:
         """,
         height=1,
     )
+
+
+def post_map_message(payload: dict) -> None:
+    """Send a lightweight update to the mounted map iframe without remounting it."""
+    post_broadcast_message(MAP_MESSAGE_TYPE, payload)
 
 
 def render_placement_map(

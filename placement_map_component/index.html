@@ -465,6 +465,9 @@
         map.on("rotate", onRotateChanged);
         map.on("moveend", scheduleViewportPush);
         map.on("zoomend", scheduleViewportPush);
+        // rotateend is the reliable end-of-gesture signal; without it a
+        // rotate-only twist can leave the last debounced push cancelled.
+        map.on("rotateend", scheduleViewportPush);
 
         // The iframe is sized by Streamlit after the first render message,
         // so re-measure once the height settles to avoid a broken tile grid.
