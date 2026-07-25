@@ -9,7 +9,7 @@ import sys
 CAST_HOST = "rtk2go.com"
 CAST_PORT = 2101
 USER_EMAIL = "voukich@gmail.com"
-SERIAL_PORT = "/dev/ttyACM0"  # Change to match your SparkFun port
+SERIAL_PORT = "/dev/serial0"  # Pi GPIO UART (not USB ACM)
 BAUDRATE = 115200             # Standard SparkFun/u-blox baud rate
 MOUNTPOINT = "CA_SanJose_ML_X5"
 # ---------------------

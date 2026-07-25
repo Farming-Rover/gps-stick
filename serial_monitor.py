@@ -10,7 +10,7 @@ import time
 
 import serial
 
-SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = "/dev/serial0"
 BAUDRATE = 115200
 
 

@@ -22,14 +22,13 @@ from placement_map_html import (
 import gps_runtime as gps_rt
 import ntrip_runtime as ntrip_rt
 # Serial Port Configuration
-SERIAL_PORT = '/dev/ttyACM0'
+SERIAL_PORT = '/dev/serial0'
 BAUD_RATE = 115200
 
 # RTK2GO NTRIP caster (same settings as ntrip-rover.py)
 NTRIP_HOST = "rtk2go.com"
 NTRIP_PORT = 2101
 NTRIP_USER_EMAIL = "voukich@gmail.com"
-NTRIP_DEFAULT_MOUNTPOINT = "CA_SanJose_ML_X5"
 
 # st.map size values are in meters (not pixels)
 GRID_MARKER_SIZE_M = 0.8
@@ -1609,6 +1608,23 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         cursor: default;
       }
 
+      .desktop-warn {
+        display: none;
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font: 600 14px/1.35 sans-serif;
+        color: #e65100;
+        background: #fff3e0;
+        border: 1px solid rgba(230, 81, 0, 0.28);
+      }
+
+      .desktop-warn.visible {
+        display: block;
+      }
+
       .fullscreen-btn {
         border: 1px solid rgba(0, 0, 0, 0.15);
         border-radius: 10px;
@@ -1755,6 +1771,9 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
           Fullscreen
         </button>
       </div>
+      <div id="desktop-warn" class="desktop-warn" role="status" aria-live="polite">
+        Open this page on a phone or tablet to get compass heading. Distance still works on desktop.
+      </div>
       <div id="rtk-bar" class="rtk-bar unknown" role="status" aria-live="polite">
         Waiting for GPS…
       </div>
@@ -1836,6 +1855,9 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       let headingFilterReady = false;
       let headingPublishTimer = null;
       let orientationEventSeen = false;
+      // Sticky across BroadcastChannel updates so desktop/insecure warnings
+      // are not wiped by distance-only payloads from the field map.
+      let panelSensorIssue = null;
       const HEADING_SMOOTHING = 0.35;
       const HEADING_PUBLISH_MS = 100;
 
@@ -2063,6 +2085,11 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
       function updatePanel(payload) {
         updateRtkBar(payload);
 
+        if (payload.sensorIssue) {
+          panelSensorIssue = payload.sensorIssue;
+        }
+        const activeSensorIssue = payload.sensorIssue || panelSensorIssue;
+
         // Quality-only updates from Python skip the distance/arrow path.
         if (
           payload.distance === undefined &&
@@ -2083,6 +2110,8 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
         const tolCm = Number.isFinite(toleranceM)
           ? (toleranceM * 100).toFixed(toleranceM * 100 < 10 ? 1 : 0)
           : "1.5";
+        const hasDistance =
+          payload.distance != null && Number.isFinite(Number(payload.distance));
 
         distanceValue.textContent = formatDistance(payload.distance);
 
@@ -2103,19 +2132,21 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
           setArrowRotation(bearing);
           statusLine.textContent = `Target${targetSuffix}`;
           statusLine.className = "status";
-        } else if (payload.sensorIssue === "insecure") {
+        } else if (activeSensorIssue === "insecure") {
           arrow.classList.add("disabled");
           setArrowRotation(null);
-          statusLine.textContent =
-            "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
+          statusLine.textContent = hasDistance
+            ? `${formatDistance(payload.distance)} to target · open over HTTPS for heading`
+            : "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
           statusLine.className = "status warn";
-        } else if (payload.sensorIssue === "desktop") {
+        } else if (activeSensorIssue === "desktop") {
           arrow.classList.add("disabled");
           setArrowRotation(null);
-          statusLine.textContent =
-            "Desktop detected: compass orientation is not available. Use a phone or tablet for the heading arrow.";
+          statusLine.textContent = hasDistance
+            ? `${formatDistance(payload.distance)}${targetSuffix} · use a phone or tablet for heading`
+            : "Desktop detected: use a phone or tablet for compass heading. Distance still works here.";
           statusLine.className = "status warn";
-        } else if (payload.sensorIssue === "no-compass") {
+        } else if (activeSensorIssue === "no-compass") {
           arrow.classList.add("disabled");
           setArrowRotation(null);
           statusLine.textContent =
@@ -2246,22 +2277,32 @@ _LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
 
       (function initCompassUi() {
         const button = document.getElementById("enable-compass");
+        const desktopWarn = document.getElementById("desktop-warn");
         const ua = navigator.userAgent || "";
         const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
         const hasTouch = (navigator.maxTouchPoints || 0) > 0;
         const desktop = !mobile && !hasTouch;
 
         if (!window.isSecureContext) {
+          if (button) {
+            button.style.display = "none";
+          }
           updatePanel({ sensorIssue: "insecure" });
           return;
         }
         if (desktop) {
-          // No device compass on desktop — hide the control entirely.
+          // No device compass on desktop — hide the control, keep a clear warning.
           if (button) {
             button.style.display = "none";
           }
+          if (desktopWarn) {
+            desktopWarn.classList.add("visible");
+          }
           updatePanel({ sensorIssue: "desktop" });
           return;
+        }
+        if (desktopWarn) {
+          desktopWarn.classList.remove("visible");
         }
         if (button) {
           button.addEventListener("click", enableCompass);
@@ -2428,15 +2469,16 @@ def latest_gps_fix():
     return coords
 
 def _resolve_gps_serial_port():
-    """Return configured port, or the available ttyACM device after USB renumbering."""
+    """Return the GPIO UART port, with common Pi serial aliases as fallback."""
     configured = Path(SERIAL_PORT)
     if configured.exists():
         return str(configured)
 
-    # Linux may change ttyACM0 to ttyACM1 after a receiver reset/replug.
-    candidates = sorted(Path("/dev").glob("ttyACM*"))
-    if candidates:
-        return str(candidates[0])
+    # /dev/serial0 is the stable Pi UART symlink; fall back to common aliases
+    # if the symlink is missing (e.g. serial console still claiming the port).
+    for candidate in ("/dev/ttyAMA0", "/dev/ttyS0", "/dev/serial1"):
+        if Path(candidate).exists():
+            return candidate
     return SERIAL_PORT
 
 
@@ -3166,7 +3208,7 @@ with st.sidebar:
             )
         if "ntrip_mountpoint_input" not in st.session_state:
             st.session_state.ntrip_mountpoint_input = (
-                (active or {}).get("mountpoint") or NTRIP_DEFAULT_MOUNTPOINT
+                (active or {}).get("mountpoint") or ""
             )
         if "ntrip_local_host" not in st.session_state:
             st.session_state.ntrip_local_host = (
@@ -3239,6 +3281,7 @@ with st.sidebar:
             "Mountpoint",
             key="ntrip_mountpoint_input",
             help=mount_help,
+            value="CA_SanJose_ML_X5"
         )
 
         try:
@@ -3259,7 +3302,7 @@ with st.sidebar:
 
         if active_key:
             st.info(
-                f"This Pi is already streaming from **{active_key}**. "
+                f"This Pi streaming from **{active_key}**. "
                 "All connected devices share that single NTRIP session."
             )
 
