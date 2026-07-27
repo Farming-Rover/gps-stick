@@ -5,6 +5,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -2569,6 +2570,7 @@ def get_ntrip_status():
         status = dict(ntrip_rt.status)
         desired = dict(ntrip_rt.desired) if ntrip_rt.desired else None
         thread = ntrip_rt.thread
+        owner_session_id = ntrip_rt.owner_session_id
 
     last_rtcm_at = float(status.get("last_rtcm_at") or 0.0)
     age_s = (time.time() - last_rtcm_at) if last_rtcm_at > 0 else None
@@ -2588,6 +2590,7 @@ def get_ntrip_status():
         status["desired_mountpoint"] = None
         status["desired_key"] = None
         status["desired"] = None
+        status["owner_session_id"] = None
         status["streaming"] = False
         status["rtcm_age_s"] = age_s
         return status
@@ -2628,6 +2631,7 @@ def get_ntrip_status():
     status["desired_mountpoint"] = mountpoint
     status["desired_key"] = active_key
     status["desired"] = desired
+    status["owner_session_id"] = owner_session_id
     return status
 
 
@@ -2868,6 +2872,13 @@ def _ensure_ntrip_thread():
         ntrip_rt.thread.start()
 
 
+def _browser_session_id():
+    """Stable id for this browser tab's Streamlit session."""
+    if "browser_session_id" not in st.session_state:
+        st.session_state.browser_session_id = uuid.uuid4().hex
+    return st.session_state.browser_session_id
+
+
 def start_ntrip(
     mountpoint,
     *,
@@ -2889,6 +2900,7 @@ def start_ntrip(
     _ensure_ntrip_thread()
     with ntrip_rt.lock:
         ntrip_rt.desired = target
+        ntrip_rt.owner_session_id = _browser_session_id()
         ntrip_rt.status["bytes_total"] = 0
         ntrip_rt.status["last_rtcm_at"] = 0.0
     _set_ntrip_status(
@@ -2902,6 +2914,7 @@ def stop_ntrip():
     """Stop streaming corrections (worker thread stays idle for a later connect)."""
     with ntrip_rt.lock:
         ntrip_rt.desired = None
+        ntrip_rt.owner_session_id = None
         ntrip_rt.status["last_rtcm_at"] = 0.0
         ntrip_rt.status["bytes_total"] = 0
         ntrip_rt.status["host"] = None
@@ -2983,6 +2996,15 @@ def init_placement_state(current_lat, current_lon):
         st.session_state.preview_origin_lat = current_lat
     if "preview_origin_lon" not in st.session_state:
         st.session_state.preview_origin_lon = current_lon
+    # First GPS reading used as the zero point for meter offsets.
+    if "grid_ref_lat" not in st.session_state:
+        st.session_state.grid_ref_lat = current_lat
+    if "grid_ref_lon" not in st.session_state:
+        st.session_state.grid_ref_lon = current_lon
+    if "origin_offset_north_m" not in st.session_state:
+        st.session_state.origin_offset_north_m = 0.0
+    if "origin_offset_east_m" not in st.session_state:
+        st.session_state.origin_offset_east_m = 0.0
     if "map_zoom" not in st.session_state:
         st.session_state.map_zoom = 19
     if "preview_orientation_deg" not in st.session_state:
@@ -2991,6 +3013,68 @@ def init_placement_state(current_lat, current_lon):
     # preview origin (instead of leaving the user's pan/zoom alone).
     if "placement_view_seq" not in st.session_state:
         st.session_state.placement_view_seq = 0
+
+
+def _meters_north_east(from_lat, from_lon, to_lat, to_lon):
+    """Return (north_m, east_m) from one lat/lon to another."""
+    north_m = (float(to_lat) - float(from_lat)) * 111320.0
+    east_m = (
+        (float(to_lon) - float(from_lon))
+        * 111320.0
+        * math.cos(math.radians(float(from_lat)))
+    )
+    return north_m, east_m
+
+
+def _origin_latlon_from_offsets(ref_lat, ref_lon, north_m, east_m):
+    """Move from the reference fix by north/east meters to a lat/lon origin."""
+    lat, lon = offset_latlon(ref_lat, ref_lon, 0.0, float(north_m))
+    return offset_latlon(lat, lon, 90.0, float(east_m))
+
+
+def queue_origin_offset_inputs(north_m, east_m):
+    """Stage meter offsets for the sidebar widgets (safe after they mount)."""
+    st.session_state.pending_origin_offset_north_m = float(north_m)
+    st.session_state.pending_origin_offset_east_m = float(east_m)
+
+
+def apply_pending_origin_offset_inputs():
+    """Apply staged offsets to widget keys. Call only before number_input mounts."""
+    if "pending_origin_offset_north_m" in st.session_state:
+        st.session_state.origin_offset_north_input = float(
+            st.session_state.pop("pending_origin_offset_north_m")
+        )
+    if "pending_origin_offset_east_m" in st.session_state:
+        st.session_state.origin_offset_east_input = float(
+            st.session_state.pop("pending_origin_offset_east_m")
+        )
+
+
+def apply_origin_offsets(north_m, east_m, *, sync_inputs=True, snap_map=True):
+    """Set the grid origin from meter offsets relative to the first GPS fix."""
+    ref_lat = float(st.session_state.grid_ref_lat)
+    ref_lon = float(st.session_state.grid_ref_lon)
+    lat, lon = _origin_latlon_from_offsets(ref_lat, ref_lon, north_m, east_m)
+    st.session_state.preview_origin_lat = lat
+    st.session_state.preview_origin_lon = lon
+    st.session_state.origin_offset_north_m = float(north_m)
+    st.session_state.origin_offset_east_m = float(east_m)
+    if sync_inputs:
+        queue_origin_offset_inputs(north_m, east_m)
+    if snap_map:
+        st.session_state.placement_view_seq += 1
+
+
+def sync_origin_offsets_from_latlon(origin_lat, origin_lon, *, sync_inputs=True):
+    """Update stored meter offsets to match an absolute origin lat/lon."""
+    ref_lat = float(st.session_state.grid_ref_lat)
+    ref_lon = float(st.session_state.grid_ref_lon)
+    north_m, east_m = _meters_north_east(ref_lat, ref_lon, origin_lat, origin_lon)
+    st.session_state.origin_offset_north_m = float(north_m)
+    st.session_state.origin_offset_east_m = float(east_m)
+    if sync_inputs:
+        queue_origin_offset_inputs(north_m, east_m)
+
 
 def _heading_delta_deg(a, b):
     """Smallest signed difference from a to b on a 0–360 circle."""
@@ -3023,6 +3107,9 @@ def apply_grid_heading_deg(orientation_deg, *, sync_input=True):
 
 
 def reset_grid_to_current_position(current_lat, current_lon, line_count_m, line_count_e, spacing):
+    st.session_state.grid_ref_lat = current_lat
+    st.session_state.grid_ref_lon = current_lon
+    apply_origin_offsets(0.0, 0.0, sync_inputs=True, snap_map=False)
     st.session_state.preview_origin_lat = current_lat
     st.session_state.preview_origin_lon = current_lon
     apply_grid_heading_deg(0.0)
@@ -3133,6 +3220,12 @@ def apply_pending_grid_load():
     st.session_state.grid_endless = endless
     st.session_state.preview_origin_lat = origin_lat
     st.session_state.preview_origin_lon = origin_lon
+    # Treat the loaded origin as the new zero point for meter offsets.
+    st.session_state.grid_ref_lat = origin_lat
+    st.session_state.grid_ref_lon = origin_lon
+    st.session_state.origin_offset_north_m = 0.0
+    st.session_state.origin_offset_east_m = 0.0
+    queue_origin_offset_inputs(0.0, 0.0)
     st.session_state.preview_orientation_deg = orientation
     st.session_state.grid_orientation_deg = orientation
     queue_grid_heading_input(orientation)
@@ -3192,6 +3285,206 @@ apply_pending_saved_grid_choice()
 
 
 with st.sidebar:
+    def _sync_grid_config_from_session():
+        """Push layout/view changes to the placement map (and live lattice if finalized)."""
+        if "grid_endless" not in st.session_state:
+            st.session_state.grid_endless = True
+        if "grid_staggered" not in st.session_state:
+            st.session_state.grid_staggered = True
+        if "grid_dim_m" not in st.session_state:
+            st.session_state.grid_dim_m = 4
+        if "grid_dim_e" not in st.session_state:
+            st.session_state.grid_dim_e = 4
+        if "grid_spacing" not in st.session_state:
+            st.session_state.grid_spacing = 2.0
+
+        spacing = float(st.session_state.grid_spacing)
+        staggered = bool(st.session_state.grid_staggered)
+        endless = bool(st.session_state.grid_endless)
+        # Endless placement preview is always a fixed 4×4 neighborhood.
+        if endless:
+            grid_lines_m, grid_lines_e = 4, 4
+        else:
+            grid_lines_m = int(st.session_state.grid_dim_m)
+            grid_lines_e = int(st.session_state.grid_dim_e)
+        grid_config = (
+            grid_lines_m,
+            grid_lines_e,
+            spacing,
+            staggered,
+            endless,
+        )
+        previous_config = st.session_state.get("last_grid_config_sent")
+        if previous_config == grid_config:
+            return
+        st.session_state.last_grid_config_sent = grid_config
+        post_map_message({
+            "action": "updateGrid",
+            "dim_m": grid_config[0],
+            "dim_e": grid_config[1],
+            "spacing_m": grid_config[2],
+            "staggered": grid_config[3],
+            "endless": grid_config[4],
+        })
+        # After finalize, regenerate the live lattice when layout toggles change.
+        if st.session_state.get("grid_finalized") and previous_config is not None:
+            latest_coords = latest_gps_fix()
+            if latest_coords is None:
+                user_lat = float(st.session_state.preview_origin_lat)
+                user_lon = float(st.session_state.preview_origin_lon)
+            else:
+                user_lat, user_lon = latest_coords
+            st.session_state.pop("last_endless_window_key", None)
+            df, center = build_active_grid_df(
+                user_lat, user_lon, grid_lines_m, grid_lines_e, spacing
+            )
+            st.session_state.grid_df = df
+            if center is not None:
+                st.session_state.last_endless_window_key = center
+            st.session_state.live_map_mounted = False
+            st.session_state.live_nav_panel_mounted = False
+            st.rerun(scope="app")
+
+    st.header("Grid Settings")
+
+    @st.fragment
+    def render_grid_settings(current_lat, current_lon):
+        if "grid_endless" not in st.session_state:
+            st.session_state.grid_endless = True
+        if "grid_staggered" not in st.session_state:
+            st.session_state.grid_staggered = True
+
+        endless = st.checkbox(
+            "Endless grid",
+            key="grid_endless",
+            help=(
+                "Infinite lattice locked at finalize. The live field view displays "
+                "only the lattice point closest to your current position. "
+                "Placement preview uses a fixed 4×4 neighborhood."
+            ),
+        )
+        st.checkbox(
+            "Staggered grid",
+            key="grid_staggered",
+            help="Offset every other row by half a spacing (like brickwork).",
+        )
+
+        if not endless:
+            st.number_input("Rows", min_value=1, value=4, key="grid_dim_m")
+            st.number_input("Columns", min_value=1, value=4, key="grid_dim_e")
+        else:
+            if "grid_dim_m" not in st.session_state:
+                st.session_state.grid_dim_m = 4
+            if "grid_dim_e" not in st.session_state:
+                st.session_state.grid_dim_e = 4
+            st.caption("Endless mode uses a fixed 4×4 placement preview.")
+
+        spacing = st.number_input(
+            "Spacing (Meters)",
+            min_value=0.5,
+            value=2.0,
+            step=0.5,
+            key="grid_spacing",
+            help="Distance between neighboring grid points.",
+        )
+
+        if not st.session_state.get("grid_finalized"):
+            apply_pending_origin_offset_inputs()
+            if "origin_offset_north_input" not in st.session_state:
+                st.session_state.origin_offset_north_input = float(
+                    st.session_state.get("origin_offset_north_m", 0.0)
+                )
+            if "origin_offset_east_input" not in st.session_state:
+                st.session_state.origin_offset_east_input = float(
+                    st.session_state.get("origin_offset_east_m", 0.0)
+                )
+            st.caption(
+                "Origin offset from the first GPS fix (or last Reset), in meters."
+            )
+            north_m = st.number_input(
+                "North (+) / South (−) m",
+                step=5.0,
+                format="%.1f",
+                key="origin_offset_north_input",
+                help=(
+                    "Move the grid origin north or south from your first GPS "
+                    "reading. Step is 5 meters."
+                ),
+            )
+            east_m = st.number_input(
+                "East (+) / West (−) m",
+                step=5.0,
+                format="%.1f",
+                key="origin_offset_east_input",
+                help=(
+                    "Move the grid origin east or west from your first GPS "
+                    "reading. Step is 5 meters."
+                ),
+            )
+            stored_north = float(st.session_state.get("origin_offset_north_m", 0.0))
+            stored_east = float(st.session_state.get("origin_offset_east_m", 0.0))
+            if (
+                abs(float(north_m) - stored_north) > 0.05
+                or abs(float(east_m) - stored_east) > 0.05
+            ):
+                apply_origin_offsets(
+                    float(north_m),
+                    float(east_m),
+                    sync_inputs=False,
+                    snap_map=True,
+                )
+                st.rerun(scope="app")
+
+            external = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
+            apply_pending_grid_heading_input()
+            if "grid_heading_input" not in st.session_state:
+                st.session_state.grid_heading_input = external
+
+            heading = st.number_input(
+                "Grid heading (°)",
+                min_value=0.0,
+                max_value=359.9,
+                step=0.5,
+                key="grid_heading_input",
+                help=(
+                    "Degrees clockwise from north for the grid row axis "
+                    "(points toward the top of the phone screen). "
+                    "Changing this rotates the map so the grid stays vertically aligned."
+                ),
+            )
+            typed = float(heading) % 360.0
+            if abs(_heading_delta_deg(external, typed)) > 0.05:
+                apply_grid_heading_deg(typed, sync_input=False)
+                st.rerun(scope="app")
+        else:
+            st.caption(
+                f"Locked origin offset: "
+                f"N {float(st.session_state.get('origin_offset_north_m', 0.0)):.1f} m, "
+                f"E {float(st.session_state.get('origin_offset_east_m', 0.0)):.1f} m "
+                f"· heading {current_grid_orientation_deg():.1f}° · "
+                f"spacing {float(st.session_state.get('grid_spacing', 2.0)):.1f} m "
+                "(Adjust grid placement to change)."
+            )
+
+        if st.button("Reset grid to current position", use_container_width=True):
+            latest_coords = latest_gps_fix()
+            if latest_coords is not None:
+                current_lat, current_lon = latest_coords
+            reset_grid_to_current_position(
+                current_lat,
+                current_lon,
+                int(st.session_state.get("grid_dim_m", 4)),
+                int(st.session_state.get("grid_dim_e", 4)),
+                float(spacing),
+            )
+            st.session_state.live_map_mounted = False
+            st.session_state.live_nav_panel_mounted = False
+            st.rerun(scope="app")
+
+        _sync_grid_config_from_session()
+
+    render_grid_settings(current_lat, current_lon)
+
     st.header("NTRIP")
 
     @st.fragment(run_every=1.0)
@@ -3208,7 +3501,7 @@ with st.sidebar:
             )
         if "ntrip_mountpoint_input" not in st.session_state:
             st.session_state.ntrip_mountpoint_input = (
-                (active or {}).get("mountpoint") or ""
+                (active or {}).get("mountpoint")
             )
         if "ntrip_local_host" not in st.session_state:
             st.session_state.ntrip_local_host = (
@@ -3281,7 +3574,7 @@ with st.sidebar:
             "Mountpoint",
             key="ntrip_mountpoint_input",
             help=mount_help,
-            value="CA_SanJose_ML_X5"
+            value="CA_SanJose_ML_X5 ",
         )
 
         try:
@@ -3300,9 +3593,9 @@ with st.sidebar:
 
         pending_switch = st.session_state.get("ntrip_pending_switch")
 
-        if active_key:
+        if active_key and status.get("owner_session_id") != _browser_session_id():
             st.info(
-                f"This Pi streaming from **{active_key}**. "
+                f"This Pi is already streaming from **{active_key}**. "
                 "All connected devices share that single NTRIP session."
             )
 
@@ -3316,7 +3609,6 @@ with st.sidebar:
             if st.button(connect_label, use_container_width=True, type="primary"):
                 try:
                     if requested_target is None:
-                        # Re-validate to surface a clear error message.
                         requested_target = _normalize_ntrip_target(
                             mountpoint=mountpoint,
                             host=host,
@@ -3327,7 +3619,6 @@ with st.sidebar:
                         )
                         requested_key = ntrip_rt.target_key(requested_target)
                     if active_key and requested_key != active_key:
-                        # Ask before tearing down the shared stream for everyone.
                         st.session_state.ntrip_pending_switch = requested_target
                         st.rerun(scope="fragment")
                     st.session_state.pop("ntrip_pending_switch", None)
@@ -3395,133 +3686,17 @@ with st.sidebar:
 
     render_ntrip_controls()
 
-    st.header("Grid Settings")
+    st.header("Saved grids")
 
     @st.fragment
-    def render_grid_settings(current_lat, current_lon):
-        if "grid_endless" not in st.session_state:
-            st.session_state.grid_endless = True
-        if "grid_staggered" not in st.session_state:
-            st.session_state.grid_staggered = True
-        endless = st.checkbox(
-            "Endless grid",
-            key="grid_endless",
-            help=(
-                "Infinite lattice locked at finalize. The live field view displays "
-                "only the lattice point closest to your current position."
-            ),
-        )
-        staggered = st.checkbox(
-            "Staggered grid",
-            key="grid_staggered",
-            help="Offset every other row by half a spacing (like brickwork).",
-        )
-        row_label = "Visible rows (spacings)" if endless else "Rows"
-        col_label = "Visible columns (spacings)" if endless else "Columns"
-        grid_lines_m = st.number_input(row_label, min_value=1, value=4, key="grid_dim_m")
-        grid_lines_e = st.number_input(col_label, min_value=1, value=4, key="grid_dim_e")
-        spacing = st.number_input(
-            "Spacing (Meters)", min_value=0.5, value=2.0, step=0.5, key="grid_spacing"
-        )
-        if endless:
-            st.caption(
-                "Rows/Columns set the placement-preview extent. After finalize, "
-                "the live field view shows only your closest lattice point. "
-                "Origin and orientation remain fixed."
-            )
-
-        if not st.session_state.get("grid_finalized"):
-            external = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
-            # Pull map/load/reset headings into the widget before it mounts.
-            apply_pending_grid_heading_input()
-            if "grid_heading_input" not in st.session_state:
-                st.session_state.grid_heading_input = external
-
-            heading = st.number_input(
-                "Grid heading (°)",
-                min_value=0.0,
-                max_value=359.9,
-                step=0.5,
-                key="grid_heading_input",
-                help=(
-                    "Degrees clockwise from north for the grid row axis "
-                    "(points toward the top of the phone screen). "
-                    "Changing this rotates the map so the grid stays vertically aligned."
-                ),
-            )
-            typed = float(heading) % 360.0
-            if abs(_heading_delta_deg(external, typed)) > 0.05:
-                # Widget already owns this value — don't rewrite the key.
-                apply_grid_heading_deg(typed, sync_input=False)
-                st.rerun(scope="app")
-        else:
-            st.caption(
-                f"Locked heading: {current_grid_orientation_deg():.1f}° from north "
-                "(Adjust grid placement to change)."
-            )
-
-        if st.button("Reset grid to current position", use_container_width=True):
-            # Fragment args are frozen at the last full-page run; read the
-            # freshest fix (kept up to date by the GPS polling fragments).
-            latest_coords = latest_gps_fix()
-            if latest_coords is not None:
-                current_lat, current_lon = latest_coords
-            reset_grid_to_current_position(
-                current_lat, current_lon, grid_lines_m, grid_lines_e, spacing
-            )
-            # reset_grid_to_current_position bumped placement_view_seq, which
-            # makes the placement map snap to the new origin on the next full
-            # run. The live map doesn't handle view/grid messages, so remount
-            # it instead. The button sits in a fragment, so the rerun must be
-            # app-scoped to reach the maps in the main body.
-            st.session_state.live_map_mounted = False
-            st.session_state.live_nav_panel_mounted = False
-            st.rerun(scope="app")
-
-        grid_config = (
-            int(grid_lines_m),
-            int(grid_lines_e),
-            float(spacing),
-            bool(staggered),
-            bool(endless),
-        )
-        previous_config = st.session_state.get("last_grid_config_sent")
-        if previous_config != grid_config:
-            st.session_state.last_grid_config_sent = grid_config
-            post_map_message({
-                "action": "updateGrid",
-                "dim_m": grid_config[0],
-                "dim_e": grid_config[1],
-                "spacing_m": grid_config[2],
-                "staggered": grid_config[3],
-                "endless": grid_config[4],
-            })
-            # After finalize, regenerate the live lattice when layout toggles change.
-            if st.session_state.get("grid_finalized") and previous_config is not None:
-                latest_coords = latest_gps_fix()
-                if latest_coords is None:
-                    user_lat = float(st.session_state.preview_origin_lat)
-                    user_lon = float(st.session_state.preview_origin_lon)
-                else:
-                    user_lat, user_lon = latest_coords
-                st.session_state.pop("last_endless_window_key", None)
-                df, center = build_active_grid_df(
-                    user_lat, user_lon, grid_lines_m, grid_lines_e, spacing
-                )
-                st.session_state.grid_df = df
-                if center is not None:
-                    st.session_state.last_endless_window_key = center
-                st.session_state.live_map_mounted = False
-                st.session_state.live_nav_panel_mounted = False
-                st.rerun(scope="app")
-
-        st.divider()
+    def render_saved_grids():
         saved_grids = list_saved_grids()
         if saved_grids:
             chosen_grid = st.selectbox(
                 "Saved grids",
                 [f.stem for f in saved_grids],
                 key="saved_grid_choice",
+                label_visibility="collapsed",
             )
             if st.button("Load grid", use_container_width=True):
                 try:
@@ -3533,20 +3708,19 @@ with st.sidebar:
                 except (OSError, json.JSONDecodeError):
                     st.error("Could not read that grid file.")
                 else:
-                    # Widgets are already instantiated this run; stage the
-                    # load and apply it at the top of the next full run.
                     st.session_state.pending_grid_load = grid_data
                     st.rerun(scope="app")
         else:
             st.caption("No saved grids yet.")
 
-    render_grid_settings(current_lat, current_lon)
+    render_saved_grids()
 
 if not st.session_state.grid_finalized:
     st.subheader("Position Your Grid")
     st.caption(
-        "Pan and zoom to place the origin, or type a **Grid heading** in the sidebar "
-        "to rotate the map so the grid stays upright on screen. "
+        "Pan and zoom to place the origin, or set **North/East offsets** (5 m steps) "
+        "and a **Grid heading** in the sidebar to rotate the map so the grid stays "
+        "upright on screen. "
         "The grid origin (green) stays at the map center. "
         "Click **Finalize grid location** to confirm."
     )
@@ -3556,12 +3730,18 @@ if not st.session_state.grid_finalized:
     # script. That keeps reruns fast on the Pi and the UI steady.
     @st.fragment
     def placement_map_fragment(user_lat, user_lon):
+        placement_endless = bool(st.session_state.get("grid_endless", True))
+        if placement_endless:
+            placement_rows, placement_cols = 4, 4
+        else:
+            placement_rows = int(st.session_state.get("grid_dim_m", 4))
+            placement_cols = int(st.session_state.get("grid_dim_e", 4))
         map_state = render_placement_map(
             center_lat=st.session_state.preview_origin_lat,
             center_lon=st.session_state.preview_origin_lon,
             zoom=st.session_state.map_zoom,
-            line_count_m=int(st.session_state.get("grid_dim_m", 4)),
-            line_count_e=int(st.session_state.get("grid_dim_e", 4)),
+            line_count_m=placement_rows,
+            line_count_e=placement_cols,
             spacing=float(st.session_state.get("grid_spacing", 2.0)),
             user_lat=user_lat,
             user_lon=user_lon,
@@ -3569,7 +3749,7 @@ if not st.session_state.grid_finalized:
             view_seq=st.session_state.placement_view_seq,
             bearing=float(st.session_state.get("preview_orientation_deg", 0.0)),
             staggered=bool(st.session_state.get("grid_staggered", True)),
-            endless=bool(st.session_state.get("grid_endless", True)),
+            endless=placement_endless,
         )
         # The component reports the map center after every pan/zoom/rotate.
         # Ignore values tagged with an old view_seq: they predate a "Reset
@@ -3581,18 +3761,39 @@ if not st.session_state.grid_finalized:
             st.session_state.preview_origin_lat = float(map_state["lat"])
             st.session_state.preview_origin_lon = float(map_state["lon"])
             st.session_state.map_zoom = int(map_state["zoom"])
+            # Keep the meter-offset inputs aligned with a manual map pan.
+            sync_origin_offsets_from_latlon(
+                st.session_state.preview_origin_lat,
+                st.session_state.preview_origin_lon,
+                sync_inputs=True,
+            )
+            north_m = float(st.session_state.origin_offset_north_m)
+            east_m = float(st.session_state.origin_offset_east_m)
+            widget_north = st.session_state.get("origin_offset_north_input")
+            widget_east = st.session_state.get("origin_offset_east_input")
+            needs_offset_sync = (
+                widget_north is None
+                or widget_east is None
+                or abs(float(widget_north) - north_m) > 0.05
+                or abs(float(widget_east) - east_m) > 0.05
+            )
+
+            needs_heading_sync = False
             if map_state.get("bearing") is not None:
                 bearing = float(map_state["bearing"]) % 360.0
                 st.session_state.preview_orientation_deg = bearing
-                # Sidebar Grid heading lives in another fragment; stage the
-                # value and remount the page so the number_input picks it up.
                 widget_heading = st.session_state.get("grid_heading_input")
-                needs_sidebar_sync = widget_heading is None or (
+                needs_heading_sync = widget_heading is None or (
                     abs(_heading_delta_deg(float(widget_heading), bearing)) > 0.05
                 )
-                if needs_sidebar_sync:
+                if needs_heading_sync:
                     queue_grid_heading_input(bearing)
-                    st.rerun(scope="app")
+
+            # Sidebar widgets live in another fragment — full app rerun is
+            # required so pending North/East (and heading) values are applied
+            # before those number_inputs remount.
+            if needs_offset_sync or needs_heading_sync:
+                st.rerun(scope="app")
 
     placement_map_fragment(current_lat, current_lon)
 

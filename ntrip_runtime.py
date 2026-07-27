@@ -26,6 +26,9 @@ stop = threading.Event()
 #   "password": str,
 # }
 desired = None
+# Streamlit browser session that last called start_ntrip (or None).
+# Used so other clients see a shared-stream notice; the owner does not.
+owner_session_id = None
 status = {
     "state": "idle",  # idle | connecting | connected | error
     "mountpoint": None,
