@@ -22,8 +22,10 @@
         var topDoc = topWin.document;
         var FIT_VIEWPORT =
           "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
-        var alreadyInstalled = !!topWin.__gpsStickShellInstalled;
-        topWin.__gpsStickShellInstalled = true;
+        // Bump when one-time shell listeners change.
+        var SHELL_VERSION = 3;
+        var alreadyInstalled = topWin.__gpsStickShellInstalled === SHELL_VERSION;
+        topWin.__gpsStickShellInstalled = SHELL_VERSION;
 
         // Remove any leftover Fit page control from earlier builds.
         var staleFit = topDoc.getElementById("gps-stick-fit-page");
@@ -64,109 +66,130 @@
         // Lock scale up front so focus-into-inputs cannot leave the page zoomed.
         ensureViewportMeta().setAttribute("content", FIT_VIEWPORT);
 
-        if (alreadyInstalled) {
-          return;
-        }
+        if (!alreadyInstalled) {
+          function sidebarEl() {
+            return topDoc.querySelector('[data-testid="stSidebar"]');
+          }
 
-        function sidebarEl() {
-          return topDoc.querySelector('[data-testid="stSidebar"]');
-        }
-
-        function isSidebarExpanded() {
-          var sidebar = sidebarEl();
-          if (!sidebar) {
-            return false;
-          }
-          var aria = sidebar.getAttribute("aria-expanded");
-          if (aria === "false") {
-            return false;
-          }
-          if (aria === "true") {
-            return true;
-          }
-          var rect = sidebar.getBoundingClientRect();
-          return rect.width > 40 && rect.left > -rect.width * 0.5;
-        }
-
-        function collapseSidebar() {
-          if (!isSidebarExpanded()) {
-            return;
-          }
-          var collapseRoot = topDoc.querySelector(
-            '[data-testid="stSidebarCollapseButton"]'
-          );
-          var button =
-            (collapseRoot && collapseRoot.querySelector("button")) ||
-            collapseRoot;
-          if (button && typeof button.click === "function") {
-            button.click();
-          }
-        }
-
-        topDoc.addEventListener(
-          "mousedown",
-          function (event) {
+          function isSidebarExpanded() {
             var sidebar = sidebarEl();
-            if (!sidebar || !isSidebarExpanded()) {
-              return;
+            if (!sidebar) {
+              return false;
             }
-            var target = event.target;
-            if (!target || !(target instanceof topWin.Node)) {
-              return;
+            var aria = sidebar.getAttribute("aria-expanded");
+            if (aria === "false") {
+              return false;
             }
-            if (sidebar.contains(target)) {
+            if (aria === "true") {
+              return true;
+            }
+            var rect = sidebar.getBoundingClientRect();
+            return rect.width > 40 && rect.left > -rect.width * 0.5;
+          }
+
+          function collapseSidebar() {
+            if (!isSidebarExpanded()) {
               return;
             }
             var collapseRoot = topDoc.querySelector(
               '[data-testid="stSidebarCollapseButton"]'
             );
-            if (collapseRoot && collapseRoot.contains(target)) {
-              return;
+            var button =
+              (collapseRoot && collapseRoot.querySelector("button")) ||
+              collapseRoot;
+            if (button && typeof button.click === "function") {
+              button.click();
             }
-            var collapsedCtl = topDoc.querySelector(
-              '[data-testid="stSidebarCollapsedControl"]'
-            );
-            if (collapsedCtl && collapsedCtl.contains(target)) {
-              return;
-            }
-            if (
-              target.closest &&
-              target.closest('iframe[data-gps-stick-fs-active="1"]')
-            ) {
-              return;
-            }
-            var main =
-              topDoc.querySelector('[data-testid="stAppViewContainer"]') ||
-              topDoc.querySelector('[data-testid="stMain"]') ||
-              topDoc.querySelector("section.main");
-            if (main && main.contains(target)) {
-              collapseSidebar();
-            }
-          },
-          true
-        );
+          }
 
-        // After leaving a text field, snap back to the unzoomed page.
-        topDoc.addEventListener(
-          "focusout",
-          function (event) {
-            var target = event.target;
-            if (!target || !target.tagName) {
-              return;
-            }
-            var tag = String(target.tagName).toLowerCase();
-            if (
-              tag === "input" ||
-              tag === "textarea" ||
-              tag === "select" ||
-              (target.getAttribute &&
-                target.getAttribute("contenteditable") === "true")
-            ) {
-              setTimeout(resetPageZoom, 50);
-            }
-          },
-          true
-        );
+          topDoc.addEventListener(
+            "mousedown",
+            function (event) {
+              var sidebar = sidebarEl();
+              if (!sidebar || !isSidebarExpanded()) {
+                return;
+              }
+              var target = event.target;
+              if (!target || !(target instanceof topWin.Node)) {
+                return;
+              }
+              if (sidebar.contains(target)) {
+                return;
+              }
+              var collapseRoot = topDoc.querySelector(
+                '[data-testid="stSidebarCollapseButton"]'
+              );
+              if (collapseRoot && collapseRoot.contains(target)) {
+                return;
+              }
+              var collapsedCtl = topDoc.querySelector(
+                '[data-testid="stSidebarCollapsedControl"]'
+              );
+              if (collapsedCtl && collapsedCtl.contains(target)) {
+                return;
+              }
+              if (
+                target.closest &&
+                target.closest('iframe[data-gps-stick-fs-active="1"]')
+              ) {
+                return;
+              }
+              var main =
+                topDoc.querySelector('[data-testid="stAppViewContainer"]') ||
+                topDoc.querySelector('[data-testid="stMain"]') ||
+                topDoc.querySelector("section.main");
+              if (main && main.contains(target)) {
+                collapseSidebar();
+              }
+            },
+            true
+          );
+
+          // After leaving a text field, snap back to the unzoomed page.
+          topDoc.addEventListener(
+            "focusout",
+            function (event) {
+              var target = event.target;
+              if (!target || !target.tagName) {
+                return;
+              }
+              var tag = String(target.tagName).toLowerCase();
+              if (
+                tag === "input" ||
+                tag === "textarea" ||
+                tag === "select" ||
+                (target.getAttribute &&
+                  target.getAttribute("contenteditable") === "true")
+              ) {
+                setTimeout(resetPageZoom, 50);
+              }
+            },
+            true
+          );
+
+          topWin.addEventListener("orientationchange", function () {
+            setTimeout(resetPageZoom, 100);
+          });
+        }
+
+        // --- Fullscreen iframe + Safari chrome (always rebind) ---
+        var FULLSCREEN_STYLE = [
+          "position:fixed",
+          "inset:0",
+          "width:100vw",
+          "height:100dvh",
+          "max-width:none",
+          "max-height:none",
+          "z-index:2147483646",
+          "border:none",
+          "background:#f4f6f8",
+          "margin:0",
+          "padding:0",
+          "display:block",
+        ].join(";");
+
+        var DARK_CHROME = "#0e1117";
+        var LIGHT_CHROME = "#f4f6f8";
 
         function findFrameIn(doc, childWin) {
           if (!doc) {
@@ -207,20 +230,90 @@
           return chain;
         }
 
-        var FULLSCREEN_STYLE = [
-          "position:fixed",
-          "inset:0",
-          "width:100vw",
-          "height:100dvh",
-          "max-width:none",
-          "max-height:none",
-          "z-index:2147483646",
-          "border:none",
-          "background:#f4f6f8",
-          "margin:0",
-          "padding:0",
-          "display:block",
-        ].join(";");
+        function replaceMeta(name, content) {
+          // Safari often ignores in-place theme-color updates; recreate the tag.
+          var existing = topDoc.querySelectorAll('meta[name="' + name + '"]');
+          for (var i = 0; i < existing.length; i += 1) {
+            if (existing[i].parentNode) {
+              existing[i].parentNode.removeChild(existing[i]);
+            }
+          }
+          var meta = topDoc.createElement("meta");
+          meta.setAttribute("name", name);
+          meta.setAttribute("content", content);
+          if (topDoc.head) {
+            topDoc.head.appendChild(meta);
+          }
+          return meta;
+        }
+
+        function captureChromeTheme() {
+          var themeMeta = topDoc.querySelector('meta[name="theme-color"]');
+          var schemeMeta = topDoc.querySelector('meta[name="color-scheme"]');
+          var appleMeta = topDoc.querySelector(
+            'meta[name="apple-mobile-web-app-status-bar-style"]'
+          );
+          topWin.__gpsStickSavedChrome = {
+            themeColor: themeMeta ? themeMeta.getAttribute("content") : null,
+            colorScheme: schemeMeta ? schemeMeta.getAttribute("content") : null,
+            appleStatus: appleMeta ? appleMeta.getAttribute("content") : null,
+            htmlColorScheme:
+              (topDoc.documentElement &&
+                topDoc.documentElement.style.colorScheme) ||
+              "",
+            bodyColorScheme:
+              (topDoc.body && topDoc.body.style.colorScheme) || "",
+          };
+        }
+
+        function setDarkSafariChrome(saved) {
+          var themeColor = (saved && saved.themeColor) || DARK_CHROME;
+          var colorScheme = (saved && saved.colorScheme) || "dark";
+          var appleStatus =
+            (saved && saved.appleStatus) || "black-translucent";
+
+          replaceMeta("theme-color", themeColor);
+          replaceMeta("color-scheme", colorScheme);
+          replaceMeta("apple-mobile-web-app-status-bar-style", appleStatus);
+
+          if (topDoc.documentElement) {
+            topDoc.documentElement.style.colorScheme =
+              (saved && saved.htmlColorScheme) || "dark";
+          }
+          if (topDoc.body) {
+            topDoc.body.style.colorScheme =
+              (saved && saved.bodyColorScheme) || "dark";
+          }
+
+          // Second pass: Safari sometimes samples chrome after layout settles.
+          setTimeout(function () {
+            replaceMeta("theme-color", themeColor);
+            replaceMeta("color-scheme", colorScheme);
+          }, 50);
+        }
+
+        function applySafariChromeTheme(active) {
+          // Light arrow fullscreen makes Safari paint white status/home areas.
+          // Restore Streamlit's dark chrome when leaving fullscreen.
+          if (active) {
+            if (!topWin.__gpsStickSavedChrome) {
+              captureChromeTheme();
+            }
+            replaceMeta("theme-color", LIGHT_CHROME);
+            replaceMeta("color-scheme", "light");
+            replaceMeta("apple-mobile-web-app-status-bar-style", "default");
+            if (topDoc.documentElement) {
+              topDoc.documentElement.style.colorScheme = "light";
+            }
+            if (topDoc.body) {
+              topDoc.body.style.colorScheme = "light";
+            }
+            return;
+          }
+
+          setDarkSafariChrome(topWin.__gpsStickSavedChrome || null);
+          topWin.__gpsStickSavedChrome = null;
+        }
 
         function setFrameFullscreen(frame, active) {
           if (!frame) {
@@ -239,20 +332,27 @@
           }
         }
 
-        topWin.addEventListener("message", function (event) {
+        if (topWin.__gpsStickNavFsHandler) {
+          topWin.removeEventListener("message", topWin.__gpsStickNavFsHandler);
+        }
+        topWin.__gpsStickNavFsHandler = function (event) {
           var data = event.data;
           if (!data || data.type !== "gps-stick-nav-fullscreen") {
             return;
           }
+          var active = !!data.active;
           var chain = collectAncestorFrames(event.source);
           for (var i = 0; i < chain.length; i += 1) {
-            setFrameFullscreen(chain[i], !!data.active);
+            setFrameFullscreen(chain[i], active);
           }
-        });
+          applySafariChromeTheme(active);
+        };
+        topWin.addEventListener("message", topWin.__gpsStickNavFsHandler);
 
-        topWin.addEventListener("orientationchange", function () {
-          setTimeout(resetPageZoom, 100);
-        });
+        // Establish dark Safari chrome unless arrow fullscreen is already open.
+        if (!topDoc.querySelector('iframe[data-gps-stick-fs-active="1"]')) {
+          setDarkSafariChrome(null);
+        }
       })();
     </script>
   </body>

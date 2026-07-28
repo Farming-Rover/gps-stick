@@ -1361,6 +1361,16 @@ def save_grid_to_file(name):
 def saved_grid_exists(name):
     return (GRID_SAVE_DIR / f"{grid_save_safe_name(name)}.json").is_file()
 
+
+def delete_saved_grid(name):
+    """Delete a saved grid JSON file. Returns True if a file was removed."""
+    path = GRID_SAVE_DIR / f"{grid_save_safe_name(name)}.json"
+    if not path.is_file():
+        return False
+    path.unlink()
+    _list_saved_grid_names.clear()
+    return True
+
 def apply_pending_grid_load():
     """Apply a grid load staged by the sidebar's Load button.
 
@@ -1407,6 +1417,13 @@ def apply_pending_saved_grid_choice():
     if choice is not None:
         st.session_state.saved_grid_choice = choice
 
+
+def apply_pending_grid_save_name():
+    """Apply a staged Grid name textbox value before the widget mounts."""
+    if "pending_grid_save_name" not in st.session_state:
+        return
+    st.session_state.grid_save_name = st.session_state.pop("pending_grid_save_name")
+
 # --- STREAMLIT UI LAYOUT ---
 st.set_page_config(page_title="RTK Live Map Guide", layout="wide")
 st.title("RTK Live Map Guide")
@@ -1443,6 +1460,7 @@ current_lat, current_lon = coords
 init_placement_state(current_lat, current_lon)
 apply_pending_grid_load()
 apply_pending_saved_grid_choice()
+apply_pending_grid_save_name()
 
 
 with st.sidebar:
@@ -1543,7 +1561,7 @@ with st.sidebar:
         spacing = st.number_input(
             "Spacing (Meters)",
             min_value=0.5,
-            value=2.0,
+            value=4.0,
             step=0.5,
             key="grid_spacing",
             help="Distance between neighboring grid points.",
@@ -1878,6 +1896,39 @@ with st.sidebar:
                 else:
                     st.session_state.pending_grid_load = grid_data
                     st.rerun(scope="app")
+
+            pending_delete = st.session_state.get("grid_delete_confirm")
+            if pending_delete and pending_delete != chosen_grid:
+                st.session_state.pop("grid_delete_confirm", None)
+                pending_delete = None
+            if st.button("Delete grid", use_container_width=True):
+                if pending_delete != chosen_grid:
+                    st.session_state.grid_delete_confirm = chosen_grid
+                    st.rerun(scope="fragment")
+                st.session_state.pop("grid_delete_confirm", None)
+                if delete_saved_grid(chosen_grid):
+                    remaining = [p.stem for p in list_saved_grids()]
+                    next_name = remaining[0] if remaining else ""
+                    # Widget keys must be written before the widgets remount.
+                    st.session_state.pending_grid_save_name = next_name
+                    if remaining:
+                        st.session_state.pending_saved_grid_choice = next_name
+                    else:
+                        st.session_state.pop("saved_grid_choice", None)
+                        st.session_state.pop("pending_saved_grid_choice", None)
+                    st.rerun(scope="app")
+                else:
+                    st.error("That grid file was already missing.")
+            # Keep permanent room under Delete so the confirm warning can
+            # appear without shoving controls off the bottom of the sidebar.
+            if pending_delete == chosen_grid:
+                st.warning(
+                    f'Delete "{chosen_grid}"? Click Delete again to confirm.'
+                )
+            st.markdown(
+                "<div aria-hidden='true' style='min-height:5.5rem'></div>",
+                unsafe_allow_html=True,
+            )
         else:
             st.caption("No saved grids yet.")
 
@@ -1967,11 +2018,6 @@ if not st.session_state.grid_finalized:
 
 else:
     df = st.session_state.grid_df
-
-    flash = st.session_state.pop("grid_save_flash", None)
-    if flash:
-        st.success(flash)
-
     grid_points = grid_df_to_points(df)
 
     st.subheader("Live Navigation")
@@ -1998,6 +2044,23 @@ else:
         post_endless_grid_window_if_needed(coords[0], coords[1])
 
     refresh_live_user_marker()
+
+    st.markdown("##### Field map")
+    st.caption(
+        "Secondary map for skip-toggles and context. "
+        "Compass-follow rotates the view while grid points stay locked to the ground."
+    )
+    if not st.session_state.get("live_map_mounted"):
+        render_live_field_map(
+            grid_points=grid_points,
+            user_lat=current_lat,
+            user_lon=current_lon,
+            center_lat=current_lat,
+            center_lon=current_lon,
+            zoom=19,
+            height=260,
+        )
+        st.session_state.live_map_mounted = True
 
     col_adjust, col_save = st.columns(2)
     with col_adjust:
@@ -2061,21 +2124,8 @@ else:
                 invalidate_live_nav_panel()
                 st.rerun(scope="app")
 
-        render_grid_save_controls()
+            flash = st.session_state.pop("grid_save_flash", None)
+            if flash:
+                st.success(flash)
 
-    st.markdown("##### Field map")
-    st.caption(
-        "Secondary map for skip-toggles and context. "
-        "Compass-follow rotates the view while grid points stay locked to the ground."
-    )
-    if not st.session_state.get("live_map_mounted"):
-        render_live_field_map(
-            grid_points=grid_points,
-            user_lat=current_lat,
-            user_lon=current_lon,
-            center_lat=current_lat,
-            center_lon=current_lon,
-            zoom=19,
-            height=260,
-        )
-        st.session_state.live_map_mounted = True
+        render_grid_save_controls()
