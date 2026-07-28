@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Leaflet is served locally by Streamlit (from the placement map
+         component's folder) instead of CDNs: faster load, works offline. -->
+    <link
+      rel="stylesheet"
+      href="/component/placement_map_html.placement_map/vendor/leaflet.css"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      #map {
+        width: 100%;
+        height: 100%;
+      }
+
+      .map-shell {
+        position: relative;
+        width: 100%;
+        height: 520px;
+      }
+
+      .map-hud {
+        position: absolute;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        pointer-events: none;
+      }
+
+      .nav-readout {
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font: 14px/1.35 sans-serif;
+        color: #222;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+      }
+
+      .nav-readout.reached {
+        background: rgba(232, 245, 233, 0.96);
+        border-color: rgba(46, 125, 50, 0.35);
+        color: #1b5e20;
+        font-weight: 600;
+      }
+
+      .nav-readout.warn {
+        background: rgba(255, 243, 224, 0.96);
+        border-color: rgba(239, 108, 0, 0.35);
+      }
+
+      .point-toast {
+        position: absolute;
+        top: 56px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1002;
+        max-width: calc(100% - 24px);
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        font: 13px/1.35 sans-serif;
+        color: #222;
+        text-align: center;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.2s ease;
+      }
+
+      .point-toast.visible {
+        opacity: 1;
+      }
+
+      /* DivIcon dots live on leaflet-rotate's norotate marker pane so they
+         stay locked to lat/lng during zoom/rotate (SVG circleMarkers drift). */
+      .gps-stick-dot-icon,
+      .gps-stick-cone-icon {
+        background: transparent !important;
+        border: none !important;
+      }
+
+      .gps-stick-dot {
+        box-sizing: border-box;
+        border-radius: 50%;
+        border: 2px solid;
+      }
+
+      .gps-stick-cone-wrap {
+        width: 40px;
+        height: 48px;
+        /* Pivot on the cone apex (bottom-center), which sits on the user dot. */
+        transform-origin: 20px 46px;
+        /* Short ease so turns feel immediate without snapping to sensor noise. */
+        transition: transform 0.12s ease-out;
+      }
+
+      .follow-toggle {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1000;
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 6px;
+        padding: 8px 12px;
+        font: 13px/1.2 sans-serif;
+        font-weight: 600;
+        color: #333;
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+        cursor: pointer;
+      }
+
+      .follow-toggle.active {
+        color: #fff;
+        background: #1565c0;
+        border-color: #0d47a1;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="map-shell">
+      <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
+      <div id="map"></div>
+      <button id="follow-toggle" class="follow-toggle" type="button" title="Toggle whether the map rotates with your heading">
+        Map: free rotate
+      </button>
+      <div id="point-toast" class="point-toast" aria-live="polite"></div>
+      <div class="map-hud">
+        <div id="nav-readout" class="nav-readout">Waiting for RTK position from the receiver...</div>
+      </div>
+    </div>
+
+    <script src="/component/placement_map_html.placement_map/vendor/leaflet.js"></script>
+    <script src="/component/placement_map_html.placement_map/vendor/leaflet-rotate.js"></script>
+    <script>
+      const MAP_MESSAGE_TYPE = __MAP_MESSAGE_TYPE__;
+      const MAP_CONFIG = JSON.parse(
+        atob(document.getElementById("map-config").dataset.configB64)
+      );
+
+      const NAV_MESSAGE_TYPE = "gps-stick-nav";
+      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
+      if (MAP_CONFIG.reach_tolerance_m == null) {
+        MAP_CONFIG.reach_tolerance_m = 0.015;
+      }
+      if (!MAP_CONFIG.grid_id) {
+        MAP_CONFIG.grid_id = "default";
+      }
+
+      const VISITED_STORAGE_PREFIX = "gps-stick-visited:";
+      // name -> {lat, lon}; persists across iframe remounts for this grid.
+      const visitedPoints = new Map();
+
+      function visitedStorageKey() {
+        return VISITED_STORAGE_PREFIX + String(MAP_CONFIG.grid_id || "default");
+      }
+
+      function loadVisitedPoints() {
+        visitedPoints.clear();
+        try {
+          const raw = window.localStorage.getItem(visitedStorageKey());
+          if (!raw) {
+            return;
+          }
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object") {
+            return;
+          }
+          Object.keys(parsed).forEach((name) => {
+            const row = parsed[name];
+            const lat = Number(row && row.lat);
+            const lon = Number(row && row.lon);
+            if (name && Number.isFinite(lat) && Number.isFinite(lon)) {
+              visitedPoints.set(String(name), { lat, lon });
+            }
+          });
+        } catch (error) {
+          // Ignore storage errors (private mode, quota, etc.).
+        }
+      }
+
+      function saveVisitedPoints() {
+        try {
+          const payload = {};
+          visitedPoints.forEach((coords, name) => {
+            payload[name] = { lat: coords.lat, lon: coords.lon };
+          });
+          window.localStorage.setItem(
+            visitedStorageKey(),
+            JSON.stringify(payload)
+          );
+        } catch (error) {
+          // Ignore storage errors.
+        }
+      }
+
+      function markPointVisited(pointName, lat, lon) {
+        const name = String(pointName || "");
+        const nextLat = Number(lat);
+        const nextLon = Number(lon);
+        if (
+          !name ||
+          !Number.isFinite(nextLat) ||
+          !Number.isFinite(nextLon) ||
+          visitedPoints.has(name)
+        ) {
+          return false;
+        }
+        visitedPoints.set(name, { lat: nextLat, lon: nextLon });
+        saveVisitedPoints();
+        return true;
+      }
+
+      loadVisitedPoints();
+
+      let sensorIssue = null; // "insecure" | "desktop" | "no-compass"
+      let orientationEventSeen = false;
+      // When true, the map bearing tracks our smoothed compass heading.
+      let followHeading = false;
+      let map = null;
+
+      function isLikelyDesktop() {
+        const ua = navigator.userAgent || "";
+        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
+        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
+        return !mobile && !hasTouch;
+      }
+
+      function showSensorWarning(issue, text) {
+        sensorIssue = issue;
+        publishNavUpdate({
+          distance: null,
+          relative_bearing: null,
+          direction: null,
+          reached: false,
+          sensorIssue: issue,
+        });
+      }
+
+      function applyExternalHeading(heading) {
+        const next = Number(heading);
+        if (!Number.isFinite(next)) {
+          return;
+        }
+        orientationEventSeen = true;
+        if (sensorIssue === "no-compass") {
+          sensorIssue = null;
+        }
+        MAP_CONFIG.user_heading = ((next % 360) + 360) % 360;
+        drawUserMarker();
+      }
+
+      function getDistanceAndBearing(lat1, lon1, lat2, lon2) {
+        const earthRadius = 6371000;
+        const phi1 = (lat1 * Math.PI) / 180;
+        const phi2 = (lat2 * Math.PI) / 180;
+        const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
+        const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
+        const a =
+          Math.sin(deltaPhi / 2) ** 2 +
+          Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) ** 2;
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        const distance = earthRadius * c;
+        const y = Math.sin(deltaLambda) * Math.cos(phi2);
+        const x =
+          Math.cos(phi1) * Math.sin(phi2) -
+          Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
+        const bearing = (Math.atan2(y, x) * 180) / Math.PI;
+        return { distance, bearing: (bearing + 360) % 360 };
+      }
+
+      function getRelativeDirection(userHeading, bearingToTarget) {
+        const relative = (bearingToTarget - userHeading + 360) % 360;
+        if (relative >= 315 || relative < 45) {
+          return "forward";
+        }
+        if (relative < 135) {
+          return "right";
+        }
+        if (relative < 225) {
+          return "back";
+        }
+        return "left";
+      }
+
+      function directionLabel(direction) {
+        return {
+          forward: "Head forward",
+          back: "Head back",
+          left: "Head left",
+          right: "Head right",
+        }[direction];
+      }
+
+      function publishNavUpdate(payload) {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
+            navChannel.postMessage(payload);
+            navChannel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function refreshNearestTarget(userLat, userLon) {
+        let nearest = null;
+        let nearestDistance = Infinity;
+        MAP_CONFIG.grid_points.forEach((point) => {
+          if (skippedPoints.has(point.point) || visitedPoints.has(point.point)) {
+            return;
+          }
+          const { distance } = getDistanceAndBearing(
+            userLat,
+            userLon,
+            point.lat,
+            point.lon
+          );
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = point;
+          }
+        });
+
+        const nextTarget = nearest ? nearest.point : null;
+        const nextLat = nearest ? nearest.lat : null;
+        const nextLon = nearest ? nearest.lon : null;
+        if (
+          nextTarget !== MAP_CONFIG.target_point ||
+          nextLat !== MAP_CONFIG.target_lat ||
+          nextLon !== MAP_CONFIG.target_lon
+        ) {
+          MAP_CONFIG.target_point = nextTarget;
+          MAP_CONFIG.target_lat = nextLat;
+          MAP_CONFIG.target_lon = nextLon;
+          drawGridMarkers();
+        }
+      }
+
+      function updateNavigationHud() {
+        const readout = document.getElementById("nav-readout");
+        if (!readout) {
+          return;
+        }
+
+        const userLat = Number(MAP_CONFIG.user_lat);
+        const userLon = Number(MAP_CONFIG.user_lon);
+        const toleranceM = Number(MAP_CONFIG.reach_tolerance_m);
+        const reachTol =
+          Number.isFinite(toleranceM) && toleranceM > 0 ? toleranceM : 0.015;
+
+        if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
+          readout.textContent = "Waiting for RTK position from the receiver...";
+          readout.className = "nav-readout";
+          publishNavUpdate({
+            distance: null,
+            relative_bearing: null,
+            direction: null,
+            reached: false,
+            tolerance_m: reachTol,
+          });
+          return;
+        }
+
+        refreshNearestTarget(userLat, userLon);
+
+        const targetLat = Number(MAP_CONFIG.target_lat);
+        const targetLon = Number(MAP_CONFIG.target_lon);
+        const targetName = MAP_CONFIG.target_point;
+
+        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
+          const anyActive = MAP_CONFIG.grid_points.some(
+            (point) =>
+              !skippedPoints.has(point.point) && !visitedPoints.has(point.point)
+          );
+          readout.textContent = anyActive
+            ? "No grid points available."
+            : "All nearby points visited or skipped — move to reveal more, or tap a yellow point to include it again.";
+          readout.className = "nav-readout";
+          publishNavUpdate({
+            distance: null,
+            relative_bearing: null,
+            direction: null,
+            reached: false,
+            target: null,
+            accuracy: MAP_CONFIG.user_accuracy,
+            tolerance_m: reachTol,
+          });
+          return;
+        }
+
+        const { distance, bearing } = getDistanceAndBearing(
+          userLat,
+          userLon,
+          targetLat,
+          targetLon
+        );
+
+        if (distance < reachTol) {
+          const tolCm = (reachTol * 100).toFixed(reachTol * 100 < 10 ? 1 : 0);
+          const justVisited = markPointVisited(targetName, targetLat, targetLon);
+          if (justVisited) {
+            showPointToast(`${targetName} visited`);
+          }
+          // Clear current target so navigation advances to the next nearest.
+          MAP_CONFIG.target_point = null;
+          MAP_CONFIG.target_lat = null;
+          MAP_CONFIG.target_lon = null;
+          drawGridMarkers();
+          refreshNearestTarget(userLat, userLon);
+          readout.textContent = `${targetName} REACHED (within ${tolCm} cm)!`;
+          readout.className = "nav-readout reached";
+          publishNavUpdate({
+            distance: 0,
+            relative_bearing: 0,
+            direction: "forward",
+            reached: true,
+            target: targetName,
+            accuracy: MAP_CONFIG.user_accuracy,
+            tolerance_m: reachTol,
+          });
+          // If another target is already available, nudge the HUD onto it next frame.
+          if (MAP_CONFIG.target_point) {
+            requestAnimationFrame(() => updateNavigationHud());
+          }
+          return;
+        }
+
+        const accuracy = Number(MAP_CONFIG.user_accuracy);
+        let accuracyNote = "";
+        if (Number.isFinite(accuracy) && accuracy > 5) {
+          accuracyNote = " · GPS accuracy is low";
+          readout.className = "nav-readout warn";
+        } else {
+          readout.className = "nav-readout";
+        }
+
+        const heading = Number(MAP_CONFIG.user_heading);
+        if (!Number.isFinite(heading)) {
+          const headingHint = {
+            insecure: "open the app over HTTPS for compass directions",
+            desktop: "compass not available on desktop",
+            "no-compass": "compass not available on this device",
+          }[sensorIssue] || "tap Enable compass for directions";
+          readout.textContent =
+            `${distance.toFixed(2)} m to ${targetName} · ${headingHint}` +
+            accuracyNote;
+          publishNavUpdate({
+            distance,
+            relative_bearing: null,
+            direction: null,
+            reached: false,
+            target: targetName,
+            accuracy,
+            sensorIssue,
+            tolerance_m: reachTol,
+          });
+          return;
+        }
+
+        const direction = getRelativeDirection(heading, bearing);
+        const relativeBearing = (bearing - heading + 360) % 360;
+        readout.textContent =
+          `${directionLabel(direction)} · ${distance.toFixed(2)} m to ${targetName}` +
+          accuracyNote;
+        publishNavUpdate({
+          distance,
+          relative_bearing: relativeBearing,
+          direction,
+          reached: false,
+          target: targetName,
+          accuracy,
+          tolerance_m: reachTol,
+        });
+      }
+
+      function makeDotIcon(color, radius, fillOpacity) {
+        const diameter = radius * 2;
+        const size = diameter + 4;
+        return L.divIcon({
+          className: "gps-stick-dot-icon",
+          iconSize: [size, size],
+          iconAnchor: [size / 2, size / 2],
+          html:
+            `<div class="gps-stick-dot" style="` +
+            `width:${diameter}px;height:${diameter}px;` +
+            `margin:2px;background:${color};border-color:${color};` +
+            `opacity:${fillOpacity};"></div>`,
+        });
+      }
+
+      function screenUpBearing() {
+        if (!map || typeof map.getBearing !== "function") {
+          return 0;
+        }
+        const bearing = Number(map.getBearing());
+        if (!Number.isFinite(bearing)) {
+          return 0;
+        }
+        return (360 - (((bearing % 360) + 360) % 360)) % 360;
+      }
+
+      function makeConeIcon(screenRotDeg) {
+        // Apex at bottom-center sits on the user dot; the cone opens upward
+        // (screen +Y at rotation 0) in the facing direction.
+        return L.divIcon({
+          className: "gps-stick-cone-icon",
+          iconSize: [40, 48],
+          iconAnchor: [20, 46],
+          html:
+            `<div class="gps-stick-cone-wrap" style="transform:rotate(${screenRotDeg}deg)">` +
+            `<svg width="40" height="48" viewBox="0 0 40 48" aria-hidden="true">` +
+            `<polygon points="20,46 36,2 4,2" fill="rgba(255,68,68,0.35)" ` +
+            `stroke="#FF4444" stroke-width="1"></polygon></svg></div>`,
+        });
+      }
+
+      const gridMarkersByPoint = new Map();
+      // Yellow skipped points are ignored when choosing the nearest target.
+      // Visited (reached) points are also yellow and stay on the map forever.
+      const skippedPoints = new Set();
+      let userDotMarker = null;
+      let facingConeMarker = null;
+      let zoomGestureActive = false;
+      let userDrawDeferred = false;
+      let pointToastTimer = null;
+
+      function mapBusyWithZoom() {
+        return zoomGestureActive || !!(map && map._animatingZoom);
+      }
+
+      function showPointToast(text) {
+        const el = document.getElementById("point-toast");
+        if (!el) {
+          return;
+        }
+        el.textContent = text;
+        el.classList.add("visible");
+        clearTimeout(pointToastTimer);
+        pointToastTimer = setTimeout(() => {
+          el.classList.remove("visible");
+        }, 1000);
+      }
+
+      function toggleSkippedPoint(pointName) {
+        if (visitedPoints.has(pointName)) {
+          // Visited points stay yellow; tapping does not clear the visit.
+          showPointToast(`${pointName} already visited`);
+          return;
+        }
+        if (skippedPoints.has(pointName)) {
+          skippedPoints.delete(pointName);
+          showPointToast(`${pointName} included again`);
+        } else {
+          skippedPoints.add(pointName);
+          showPointToast(`${pointName} excluded`);
+          if (MAP_CONFIG.target_point === pointName) {
+            MAP_CONFIG.target_point = null;
+            MAP_CONFIG.target_lat = null;
+            MAP_CONFIG.target_lon = null;
+          }
+        }
+        drawGridMarkers();
+        updateNavigationHud();
+      }
+
+      function pointsToDraw() {
+        const byName = new Map();
+        MAP_CONFIG.grid_points.forEach((point) => {
+          byName.set(point.point, {
+            point: point.point,
+            lat: Number(point.lat),
+            lon: Number(point.lon),
+          });
+        });
+        // Visited points persist even after they leave the nearest-4 window.
+        visitedPoints.forEach((coords, name) => {
+          if (!byName.has(name)) {
+            byName.set(name, {
+              point: name,
+              lat: coords.lat,
+              lon: coords.lon,
+            });
+          }
+        });
+        return Array.from(byName.values()).filter(
+          (point) =>
+            point.point &&
+            Number.isFinite(point.lat) &&
+            Number.isFinite(point.lon)
+        );
+      }
+
+      function drawGridMarkers() {
+        const drawable = pointsToDraw();
+        const keep = new Set(drawable.map((point) => point.point));
+        gridMarkersByPoint.forEach((marker, pointName) => {
+          if (!keep.has(pointName)) {
+            map.removeLayer(marker);
+            gridMarkersByPoint.delete(pointName);
+          }
+        });
+        if (
+          MAP_CONFIG.target_point != null &&
+          !keep.has(MAP_CONFIG.target_point)
+        ) {
+          MAP_CONFIG.target_point = null;
+          MAP_CONFIG.target_lat = null;
+          MAP_CONFIG.target_lon = null;
+        }
+        drawable.forEach((point) => {
+          const visited = visitedPoints.has(point.point);
+          const skipped = skippedPoints.has(point.point);
+          const isTarget =
+            !skipped && !visited && point.point === MAP_CONFIG.target_point;
+          let color;
+          let radius;
+          let fillOpacity;
+          let zIndex;
+          if (visited || skipped) {
+            color = "#FFD600";
+            radius = visited ? 8 : 7;
+            fillOpacity = 0.95;
+            zIndex = visited ? 350 : 300;
+          } else if (isTarget) {
+            color = "#00FF00";
+            radius = 9;
+            fillOpacity = 0.9;
+            zIndex = 400;
+          } else {
+            color = "#1E90FF";
+            radius = 6;
+            fillOpacity = 0.45;
+            zIndex = 200;
+          }
+          const icon = makeDotIcon(color, radius, fillOpacity);
+          let marker = gridMarkersByPoint.get(point.point);
+          if (!marker) {
+            marker = L.marker([point.lat, point.lon], {
+              icon,
+              keyboard: false,
+              zIndexOffset: zIndex,
+            })
+              .on("click", (event) => {
+                L.DomEvent.stopPropagation(event);
+                toggleSkippedPoint(point.point);
+              })
+              .addTo(map);
+            gridMarkersByPoint.set(point.point, marker);
+          } else {
+            marker.setLatLng([point.lat, point.lon]);
+            marker.setIcon(icon);
+            marker.setZIndexOffset(zIndex);
+          }
+        });
+      }
+
+      // Cumulative CSS angle for the cone. Tracking the shortest-path delta
+      // (instead of a raw 0-360 value) keeps the CSS transition from spinning
+      // the long way around when the heading crosses north.
+      let coneScreenRotCum = null;
+
+      function updateFacingCone() {
+        const heading = Number(MAP_CONFIG.user_heading);
+        const lat = Number(MAP_CONFIG.user_lat);
+        const lon = Number(MAP_CONFIG.user_lon);
+        if (
+          !Number.isFinite(heading) ||
+          !Number.isFinite(lat) ||
+          !Number.isFinite(lon)
+        ) {
+          if (facingConeMarker) {
+            map.removeLayer(facingConeMarker);
+            facingConeMarker = null;
+            coneScreenRotCum = null;
+          }
+          return;
+        }
+        // When the map follows heading, screen-up == facing, so the cone
+        // points straight up on screen. Otherwise CSS rotate (clockwise)
+        // is heading relative to geographic screen-up.
+        const target = followHeading
+          ? 0
+          : (heading - screenUpBearing() + 360) % 360;
+        if (!facingConeMarker) {
+          coneScreenRotCum = target;
+          facingConeMarker = L.marker([lat, lon], {
+            icon: makeConeIcon(target),
+            interactive: false,
+            keyboard: false,
+            zIndexOffset: 550,
+          }).addTo(map);
+          return;
+        }
+        facingConeMarker.setLatLng([lat, lon]);
+        const currentMod = ((coneScreenRotCum % 360) + 360) % 360;
+        coneScreenRotCum += ((target - currentMod + 540) % 360) - 180;
+        const el = facingConeMarker.getElement();
+        const wrap = el && el.querySelector(".gps-stick-cone-wrap");
+        if (wrap) {
+          // Mutate the existing element so the CSS transition animates the
+          // turn; setIcon would replace the DOM node and jump instead.
+          wrap.style.transform = `rotate(${coneScreenRotCum}deg)`;
+        } else {
+          facingConeMarker.setIcon(makeConeIcon(target));
+        }
+      }
+
+      function drawUserMarker() {
+        if (mapBusyWithZoom()) {
+          // setLatLng mid-zoom animation drifts markers; apply after zoomend.
+          userDrawDeferred = true;
+          return;
+        }
+        const lat = Number(MAP_CONFIG.user_lat);
+        const lon = Number(MAP_CONFIG.user_lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+          return;
+        }
+        const icon = makeDotIcon("#FF0000", 7, 1.0);
+        if (!userDotMarker) {
+          userDotMarker = L.marker([lat, lon], {
+            icon,
+            keyboard: false,
+            zIndexOffset: 600,
+          })
+            .bindPopup("Your position")
+            .addTo(map);
+        } else {
+          userDotMarker.setLatLng([lat, lon]);
+          userDotMarker.setIcon(icon);
+        }
+        updateFacingCone();
+        updateNavigationHud();
+      }
+
+      // Heading filter state. Android fires BOTH deviceorientationabsolute
+      // (true north) and plain deviceorientation (relative, arbitrary zero);
+      // mixing them makes the heading jump. Once an absolute source is seen,
+      // relative readings are discarded.
+      let hasAbsoluteHeading = false;
+      let headingSin = null;
+      let headingCos = null;
+      let headingFilterReady = false;
+      let headingRefreshTimer = null;
+      let mapBearingTimer = null;
+      let lastAppliedMapBearing = null;
+      // Higher = snappier (closer to raw). Still an EMA on sin/cos so wrap and
+      // magnetometer jitter stay filtered instead of driving the UI raw.
+      const HEADING_SMOOTHING = 0.35;
+      // Cone + nav arrow refresh (~10 Hz). Map follow stays on its own ~30 fps
+      // loop. Latency came mostly from the old 0.5 Hz UI sample + 1.8s CSS ease.
+      const HEADING_REFRESH_MS = 100;
+      const MAP_BEARING_MS = 1000 / 30;
+      // Ignore stillness wiggle, but start tracking real turns sooner than 3°.
+      const HEADING_DEADBAND_DEG = 1.5;
+      // Tiny map deadband so 30 fps still feels continuous but skips noise.
+      const MAP_BEARING_DEADBAND_DEG = 0.35;
+
+      function getSmoothedHeading() {
+        if (!headingFilterReady) {
+          return null;
+        }
+        return (
+          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360
+        );
+      }
+
+      function applyConeHeading() {
+        const smoothed = getSmoothedHeading();
+        if (smoothed == null) {
+          return;
+        }
+        const previous = Number(MAP_CONFIG.user_heading);
+        if (Number.isFinite(previous)) {
+          const delta = Math.abs(((smoothed - previous + 540) % 360) - 180);
+          if (delta < HEADING_DEADBAND_DEG) {
+            return;
+          }
+        }
+        MAP_CONFIG.user_heading = smoothed;
+        // Map bearing is driven by the 30 fps loop when followHeading is on.
+        drawUserMarker();
+      }
+
+      function applyMapBearing() {
+        if (
+          !followHeading ||
+          !map ||
+          typeof map.setBearing !== "function" ||
+          mapBusyWithZoom()
+        ) {
+          return;
+        }
+        const smoothed = getSmoothedHeading();
+        if (smoothed == null) {
+          return;
+        }
+        if (lastAppliedMapBearing != null) {
+          const delta = Math.abs(
+            ((smoothed - lastAppliedMapBearing + 540) % 360) - 180
+          );
+          if (delta < MAP_BEARING_DEADBAND_DEG) {
+            return;
+          }
+        }
+        lastAppliedMapBearing = smoothed;
+        // leaflet-rotate pane angle is opposite screen-up; put heading at top.
+        map.setBearing((360 - smoothed) % 360);
+      }
+
+      function startHeadingRefreshTimer() {
+        if (headingRefreshTimer != null) {
+          return;
+        }
+        applyConeHeading();
+        headingRefreshTimer = setInterval(applyConeHeading, HEADING_REFRESH_MS);
+      }
+
+      function stopHeadingRefreshTimer() {
+        if (headingRefreshTimer != null) {
+          clearInterval(headingRefreshTimer);
+          headingRefreshTimer = null;
+        }
+      }
+
+      function startMapBearingTimer() {
+        if (mapBearingTimer != null) {
+          return;
+        }
+        lastAppliedMapBearing = null;
+        applyMapBearing();
+        mapBearingTimer = setInterval(applyMapBearing, MAP_BEARING_MS);
+      }
+
+      function stopMapBearingTimer() {
+        if (mapBearingTimer != null) {
+          clearInterval(mapBearingTimer);
+          mapBearingTimer = null;
+        }
+        lastAppliedMapBearing = null;
+      }
+
+      function updateFollowToggleUi() {
+        const btn = document.getElementById("follow-toggle");
+        if (!btn) {
+          return;
+        }
+        btn.classList.toggle("active", followHeading);
+        if (followHeading) {
+          btn.textContent = "Map: follows heading";
+          btn.title = "Map rotates so the direction you face is always up";
+        } else {
+          btn.textContent = "Map: free rotate";
+          btn.title =
+            "Map stays where you leave it; rotate with two fingers. Cone shows heading.";
+        }
+      }
+
+      function setFollowHeading(enabled) {
+        followHeading = !!enabled;
+        if (map) {
+          if (followHeading) {
+            if (map.touchRotate && map.touchRotate.disable) {
+              map.touchRotate.disable();
+            }
+            if (map.shiftKeyRotate && map.shiftKeyRotate.disable) {
+              map.shiftKeyRotate.disable();
+            }
+            startMapBearingTimer();
+          } else {
+            stopMapBearingTimer();
+            if (map.touchRotate && map.touchRotate.enable) {
+              map.touchRotate.enable();
+            }
+            if (map.shiftKeyRotate && map.shiftKeyRotate.enable) {
+              map.shiftKeyRotate.enable();
+            }
+          }
+          if (map.compassBearing) {
+            map.compassBearing._enabled = followHeading;
+            map.fire("rotate");
+          }
+        }
+        updateFollowToggleUi();
+        updateFacingCone();
+      }
+
+      function extractHeading(event) {
+        // iOS Safari: true compass heading, already in degrees from north.
+        if (
+          event.webkitCompassHeading != null &&
+          Number.isFinite(event.webkitCompassHeading)
+        ) {
+          return { heading: event.webkitCompassHeading, absolute: true };
+        }
+        if (event.alpha != null && Number.isFinite(event.alpha)) {
+          const absolute =
+            event.absolute === true || event.type === "deviceorientationabsolute";
+          return { heading: (360 - event.alpha) % 360, absolute };
+        }
+        return null;
+      }
+
+      function onDeviceOrientation(event) {
+        orientationEventSeen = true;
+        if (sensorIssue === "no-compass") {
+          sensorIssue = null;
+        }
+
+        const reading = extractHeading(event);
+        if (reading == null) {
+          return;
+        }
+
+        if (reading.absolute) {
+          hasAbsoluteHeading = true;
+        } else if (hasAbsoluteHeading) {
+          // A north-referenced source exists; ignore relative readings.
+          return;
+        }
+
+        // Low-pass filter on the heading's unit vector. Filtering sin/cos
+        // instead of degrees handles the 359°->0° wraparound correctly and
+        // absorbs magnetometer jitter.
+        const rad = (reading.heading * Math.PI) / 180;
+        if (headingSin == null) {
+          headingSin = Math.sin(rad);
+          headingCos = Math.cos(rad);
+        } else {
+          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
+          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
+        }
+        headingFilterReady = true;
+      }
+
+      async function requestOrientationPermission() {
+        if (
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+        ) {
+          const response = await DeviceOrientationEvent.requestPermission();
+          return response === "granted";
+        }
+        return true;
+      }
+
+      function startCompass() {
+        // Android Chrome delivers true-north headings via the "absolute"
+        // event; iOS Safari only fires plain deviceorientation (with
+        // webkitCompassHeading). Listen to both and let whichever fires win.
+        if ("ondeviceorientationabsolute" in window) {
+          window.addEventListener(
+            "deviceorientationabsolute",
+            onDeviceOrientation,
+            true
+          );
+        }
+        window.addEventListener("deviceorientation", onDeviceOrientation, true);
+        startHeadingRefreshTimer();
+
+        setTimeout(() => {
+          if (!orientationEventSeen && sensorIssue == null) {
+            showSensorWarning(
+              "no-compass",
+              "No compass data is coming from this device. Distance still works, but facing direction will be unavailable."
+            );
+          }
+        }, 4000);
+      }
+
+      async function enableClientSensors() {
+        try {
+          const orientationGranted = await requestOrientationPermission();
+          if (!orientationGranted) {
+            const readout = document.getElementById("nav-readout");
+            if (readout) {
+              readout.textContent =
+                "Compass permission denied. You can still see distance, but not facing direction.";
+              readout.className = "nav-readout warn";
+            }
+          }
+        } catch (error) {
+          // Still attach listeners; some browsers fire events without the prompt.
+        }
+        startCompass();
+      }
+
+      function handleMapMessage(data) {
+        if (!data || data.type !== MAP_MESSAGE_TYPE || !map) {
+          return;
+        }
+
+        if (data.action === "updateUser") {
+          const nextLat = Number(data.user_lat);
+          const nextLon = Number(data.user_lon);
+          if (
+            !Number.isFinite(nextLat) ||
+            !Number.isFinite(nextLon) ||
+            (nextLat === MAP_CONFIG.user_lat && nextLon === MAP_CONFIG.user_lon)
+          ) {
+            return;
+          }
+          MAP_CONFIG.user_lat = nextLat;
+          MAP_CONFIG.user_lon = nextLon;
+          drawUserMarker();
+          return;
+        }
+
+        if (data.action === "updateGridPoints") {
+          const points = Array.isArray(data.grid_points) ? data.grid_points : [];
+          MAP_CONFIG.grid_points = points
+            .map((point) => ({
+              point: String(point.point),
+              lat: Number(point.lat),
+              lon: Number(point.lon),
+            }))
+            .filter(
+              (point) =>
+                point.point &&
+                Number.isFinite(point.lat) &&
+                Number.isFinite(point.lon)
+            );
+          drawGridMarkers();
+          updateNavigationHud();
+        }
+      }
+
+      map = L.map("map", {
+        center: [MAP_CONFIG.center_lat, MAP_CONFIG.center_lon],
+        zoom: MAP_CONFIG.zoom,
+        zoomControl: true,
+        maxZoom: 25,
+        rotate: true,
+        bearing: 0,
+        touchRotate: true,
+        shiftKeyRotate: true,
+        rotateControl: {
+          closeOnZeroBearing: false,
+          position: "topleft",
+        },
+      });
+
+      // Drive "compass follow" from our own heading filter (handles iOS/Android
+      // quirks). Hijack the plugin handler so the rotate control's orange
+      // compass mode toggles followHeading instead of attaching a second listener.
+      if (map.compassBearing) {
+        map.compassBearing.enable = function () {
+          setFollowHeading(true);
+          return this;
+        };
+        map.compassBearing.disable = function () {
+          setFollowHeading(false);
+          return this;
+        };
+        map.compassBearing.enabled = function () {
+          return !!followHeading;
+        };
+      }
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "&copy; OpenStreetMap contributors",
+        maxZoom: 25,
+        maxNativeZoom: 19,
+      }).addTo(map);
+
+      L.control
+        .scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 120 })
+        .addTo(map);
+
+      // Markers (DivIcon) sit on leaflet-rotate's norotate pane and stay locked
+      // to lat/lng during zoom/rotate. SVG circleMarkers on overlayPane drift.
+      drawGridMarkers();
+      drawUserMarker();
+
+      map.on("zoomstart", () => {
+        zoomGestureActive = true;
+      });
+      map.on("zoomend", () => {
+        zoomGestureActive = false;
+        gridMarkersByPoint.forEach((marker) => marker.update());
+        if (userDotMarker) {
+          userDotMarker.update();
+        }
+        if (facingConeMarker) {
+          facingConeMarker.update();
+        }
+        if (userDrawDeferred) {
+          userDrawDeferred = false;
+          drawUserMarker();
+        } else {
+          updateFacingCone();
+        }
+      });
+      map.on("rotate", () => {
+        // In follow mode the cone stays screen-up (target 0) and the map
+        // turns underneath at 30 fps — skip cone work on every rotate tick.
+        if (!mapBusyWithZoom() && !followHeading) {
+          updateFacingCone();
+        }
+      });
+
+      // Browsers remove geolocation and orientation APIs entirely on plain
+      // HTTP (except localhost), so check the secure context before blaming
+      // the device type.
+      if (!window.isSecureContext) {
+        showSensorWarning(
+          "insecure",
+          "This page is served over HTTP, so the browser blocks compass access. Position from the RTK receiver still works, but open the app via HTTPS for facing direction."
+        );
+      } else if (isLikelyDesktop()) {
+        showSensorWarning(
+          "desktop",
+          "Desktop browsers usually do not provide compass orientation. Use a phone or tablet to see which way you are facing and get forward/back/left/right directions."
+        );
+      }
+
+      document
+        .getElementById("follow-toggle")
+        .addEventListener("click", () => {
+          setFollowHeading(!followHeading);
+        });
+      updateFollowToggleUi();
+
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          const gridChannel = new BroadcastChannel(MAP_MESSAGE_TYPE);
+          gridChannel.onmessage = (event) => {
+            handleMapMessage(event.data);
+          };
+          const navConfigChannel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
+          navConfigChannel.onmessage = (event) => {
+            const nextTol = Number(event.data && event.data.tolerance_m);
+            if (Number.isFinite(nextTol) && nextTol > 0) {
+              MAP_CONFIG.reach_tolerance_m = nextTol;
+              updateNavigationHud();
+            }
+          };
+          // Compass is enabled from the Live Navigation panel (not a map
+          // overlay). Heading can arrive from that panel, or this iframe
+          // can start its own sensors when told to enable.
+          const headingChannel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+          headingChannel.onmessage = (event) => {
+            const data = event.data || {};
+            if (data.action === "enableCompass") {
+              enableClientSensors();
+              return;
+            }
+            if (data.heading != null) {
+              applyExternalHeading(data.heading);
+            }
+          };
+        }
+      } catch (error) {
+        // Ignore channel errors on older browsers.
+      }
+
+      try {
+        if (window.parent.__gpsStickMapHandler) {
+          window.parent.removeEventListener(
+            "message",
+            window.parent.__gpsStickMapHandler
+          );
+        }
+        window.parent.__gpsStickMapHandler = (event) => {
+          handleMapMessage(event.data);
+        };
+        window.parent.addEventListener(
+          "message",
+          window.parent.__gpsStickMapHandler
+        );
+      } catch (error) {
+        // Ignore parent listener errors in restricted iframes.
+      }
+    </script>
+  </body>
+</html>

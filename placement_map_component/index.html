@@ -387,6 +387,18 @@
           return;
         }
 
+        if (data.action === "setView") {
+          const lat =
+            data.lat != null ? Number(data.lat) : map.getCenter().lat;
+          const lon =
+            data.lon != null ? Number(data.lon) : map.getCenter().lng;
+          const zoom = data.zoom != null ? Number(data.zoom) : map.getZoom();
+          const bearing =
+            data.bearing != null ? Number(data.bearing) : undefined;
+          applyView(lat, lon, zoom, bearing);
+          return;
+        }
+
         if (data.action === "updateUser") {
           const nextLat = Number(data.user_lat);
           const nextLon = Number(data.user_lon);
@@ -452,7 +464,7 @@
           // Debounce all origin reports so a pan/rotate gesture becomes one
           // Streamlit fragment rerun instead of a flood of them.
           clearTimeout(viewportPushTimer);
-          viewportPushTimer = setTimeout(pushViewportToStreamlit, 250);
+          viewportPushTimer = setTimeout(pushViewportToStreamlit, 400);
         }
 
         function onRotateChanged() {

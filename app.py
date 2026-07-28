@@ -8,7 +8,6 @@ import time
 import uuid
 from pathlib import Path
 
-import pandas as pd
 import pynmea2
 import serial
 import streamlit as st
@@ -30,6 +29,7 @@ BAUD_RATE = 115200
 NTRIP_HOST = "rtk2go.com"
 NTRIP_PORT = 2101
 NTRIP_USER_EMAIL = "voukich@gmail.com"
+NTRIP_DEFAULT_MOUNTPOINT = "CA_SanJose_ML_X5"
 
 # st.map size values are in meters (not pixels)
 GRID_MARKER_SIZE_M = 0.8
@@ -256,10 +256,10 @@ def generate_grid(
                 "color": "#1E90FF",
                 "size": GRID_MARKER_SIZE_M,
             })
-    return pd.DataFrame(grid)
+    return grid
 
 
-def generate_nearest_endless_grid_point(
+def generate_nearest_endless_grid_points(
     origin_lat,
     origin_lon,
     user_lat,
@@ -267,42 +267,69 @@ def generate_nearest_endless_grid_point(
     spacing_meters,
     orientation_deg=0,
     staggered=True,
+    count=4,
 ):
-    """Return only the closest point in the infinite, oriented lattice."""
+    """Return the closest `count` points in the infinite, oriented lattice."""
+    count = max(1, int(count))
     row_m, col_m = _local_row_col_meters(
         origin_lat, origin_lon, user_lat, user_lon, orientation_deg
     )
     center_r, center_c = _nearest_lattice_indices(
         row_m, col_m, spacing_meters, staggered
     )
-    point_lat, point_lon = _grid_point_latlon(
-        origin_lat,
-        origin_lon,
-        center_r,
-        center_c,
-        spacing_meters,
-        orientation_deg,
-        staggered,
-    )
-    grid = [{
-        "Point": f"R{center_r}C{center_c}",
-        "lat": point_lat,
-        "lon": point_lon,
-        "color": "#1E90FF",
-        "size": GRID_MARKER_SIZE_M,
-    }]
-    return pd.DataFrame(grid), (center_r, center_c)
+    spacing = float(spacing_meters)
+    # Neighborhood large enough that the N nearest lattice points are included.
+    search = max(2, int(math.ceil(math.sqrt(count))) + 1)
+    candidates = []
+    for r in range(center_r - search, center_r + search + 1):
+        stagger = (spacing / 2.0) if (staggered and _row_is_odd(r)) else 0.0
+        for c in range(center_c - search, center_c + search + 1):
+            d_row = row_m - r * spacing
+            d_col = col_m - (c * spacing + stagger)
+            dist2 = d_row * d_row + d_col * d_col
+            candidates.append((dist2, r, c))
+    candidates.sort(key=lambda item: item[0])
+
+    grid = []
+    key_parts = []
+    for _dist2, r, c in candidates[:count]:
+        point_lat, point_lon = _grid_point_latlon(
+            origin_lat,
+            origin_lon,
+            r,
+            c,
+            spacing_meters,
+            orientation_deg,
+            staggered,
+        )
+        name = f"R{r}C{c}"
+        key_parts.append(name)
+        grid.append({
+            "Point": name,
+            "lat": point_lat,
+            "lon": point_lon,
+            "color": "#1E90FF",
+            "size": GRID_MARKER_SIZE_M,
+        })
+    return grid, tuple(sorted(key_parts))
 
 
 def grid_df_to_points(df):
+    """Convert grid rows (list[dict] or legacy DataFrame-like) to map points."""
+    if df is None:
+        return []
+    if hasattr(df, "to_dict"):
+        rows = df.to_dict("records")
+    else:
+        rows = df
     return [
         {"point": row["Point"], "lat": float(row["lat"]), "lon": float(row["lon"])}
-        for _, row in df.iterrows()
+        for row in rows
     ]
 
 
 def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing):
-    """Build the active grid DataFrame from current session settings."""
+    """Build the active grid rows from current session settings."""
     origin_lat = float(st.session_state.preview_origin_lat)
     origin_lon = float(st.session_state.preview_origin_lon)
     orientation = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
@@ -310,7 +337,7 @@ def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing
         orientation = float(st.session_state.grid_orientation_deg) % 360.0
     staggered = bool(st.session_state.get("grid_staggered", True))
     if st.session_state.get("grid_endless", True):
-        df, center = generate_nearest_endless_grid_point(
+        df, center = generate_nearest_endless_grid_points(
             origin_lat,
             origin_lon,
             user_lat,
@@ -318,6 +345,7 @@ def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing
             spacing,
             orientation,
             staggered,
+            count=4,
         )
         return df, center
     return (
@@ -333,1990 +361,65 @@ def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing
         None,
     )
 
-_LIVE_FIELD_MAP_HTML = """<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- Leaflet is served locally by Streamlit (from the placement map
-         component's folder) instead of CDNs: faster load, works offline. -->
-    <link
-      rel="stylesheet"
-      href="/component/placement_map_html.placement_map/vendor/leaflet.css"
-    />
-    <style>
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-      }
-
-      #map {
-        width: 100%;
-        height: 100%;
-      }
-
-      .map-shell {
-        position: relative;
-        width: 100%;
-        height: 520px;
-      }
-
-      .map-hud {
-        position: absolute;
-        left: 10px;
-        right: 10px;
-        bottom: 10px;
-        z-index: 1000;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        pointer-events: none;
-      }
-
-      .nav-readout {
-        background: rgba(255, 255, 255, 0.94);
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        border-radius: 8px;
-        padding: 10px 12px;
-        font: 14px/1.35 sans-serif;
-        color: #222;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
-      }
-
-      .nav-readout.reached {
-        background: rgba(232, 245, 233, 0.96);
-        border-color: rgba(46, 125, 50, 0.35);
-        color: #1b5e20;
-        font-weight: 600;
-      }
-
-      .nav-readout.warn {
-        background: rgba(255, 243, 224, 0.96);
-        border-color: rgba(239, 108, 0, 0.35);
-      }
-
-      .point-toast {
-        position: absolute;
-        top: 56px;
-        left: 50%;
-        transform: translateX(-50%);
-        z-index: 1002;
-        max-width: calc(100% - 24px);
-        padding: 8px 12px;
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.96);
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-        font: 13px/1.35 sans-serif;
-        color: #222;
-        text-align: center;
-        pointer-events: none;
-        opacity: 0;
-        transition: opacity 0.2s ease;
-      }
-
-      .point-toast.visible {
-        opacity: 1;
-      }
-
-      /* DivIcon dots live on leaflet-rotate's norotate marker pane so they
-         stay locked to lat/lng during zoom/rotate (SVG circleMarkers drift). */
-      .gps-stick-dot-icon,
-      .gps-stick-cone-icon {
-        background: transparent !important;
-        border: none !important;
-      }
-
-      .gps-stick-dot {
-        box-sizing: border-box;
-        border-radius: 50%;
-        border: 2px solid;
-      }
-
-      .gps-stick-cone-wrap {
-        width: 40px;
-        height: 48px;
-        /* Pivot on the cone apex (bottom-center), which sits on the user dot. */
-        transform-origin: 20px 46px;
-        /* Short ease so turns feel immediate without snapping to sensor noise. */
-        transition: transform 0.12s ease-out;
-      }
-
-      .follow-toggle {
-        position: absolute;
-        top: 10px;
-        right: 10px;
-        z-index: 1000;
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        border-radius: 6px;
-        padding: 8px 12px;
-        font: 13px/1.2 sans-serif;
-        font-weight: 600;
-        color: #333;
-        background: rgba(255, 255, 255, 0.95);
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
-        cursor: pointer;
-      }
-
-      .follow-toggle.active {
-        color: #fff;
-        background: #1565c0;
-        border-color: #0d47a1;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="map-shell">
-      <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
-      <div id="map"></div>
-      <button id="follow-toggle" class="follow-toggle" type="button" title="Toggle whether the map rotates with your heading">
-        Map: free rotate
-      </button>
-      <div id="point-toast" class="point-toast" aria-live="polite"></div>
-      <div class="map-hud">
-        <div id="nav-readout" class="nav-readout">Waiting for RTK position from the receiver...</div>
-      </div>
-    </div>
-
-    <script src="/component/placement_map_html.placement_map/vendor/leaflet.js"></script>
-    <script src="/component/placement_map_html.placement_map/vendor/leaflet-rotate.js"></script>
-    <script>
-      const MAP_MESSAGE_TYPE = __MAP_MESSAGE_TYPE__;
-      const MAP_CONFIG = JSON.parse(
-        atob(document.getElementById("map-config").dataset.configB64)
-      );
-
-      const NAV_MESSAGE_TYPE = "gps-stick-nav";
-      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
-      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
-      if (MAP_CONFIG.reach_tolerance_m == null) {
-        MAP_CONFIG.reach_tolerance_m = 0.015;
-      }
-      let sensorIssue = null; // "insecure" | "desktop" | "no-compass"
-      let orientationEventSeen = false;
-      // When true, the map bearing tracks our smoothed compass heading.
-      let followHeading = false;
-      let map = null;
-
-      function isLikelyDesktop() {
-        const ua = navigator.userAgent || "";
-        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
-        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
-        return !mobile && !hasTouch;
-      }
-
-      function showSensorWarning(issue, text) {
-        sensorIssue = issue;
-        publishNavUpdate({
-          distance: null,
-          relative_bearing: null,
-          direction: null,
-          reached: false,
-          sensorIssue: issue,
-        });
-      }
-
-      function applyExternalHeading(heading) {
-        const next = Number(heading);
-        if (!Number.isFinite(next)) {
-          return;
-        }
-        orientationEventSeen = true;
-        if (sensorIssue === "no-compass") {
-          sensorIssue = null;
-        }
-        MAP_CONFIG.user_heading = ((next % 360) + 360) % 360;
-        drawUserMarker();
-      }
-
-      function getDistanceAndBearing(lat1, lon1, lat2, lon2) {
-        const earthRadius = 6371000;
-        const phi1 = (lat1 * Math.PI) / 180;
-        const phi2 = (lat2 * Math.PI) / 180;
-        const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
-        const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
-        const a =
-          Math.sin(deltaPhi / 2) ** 2 +
-          Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) ** 2;
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = earthRadius * c;
-        const y = Math.sin(deltaLambda) * Math.cos(phi2);
-        const x =
-          Math.cos(phi1) * Math.sin(phi2) -
-          Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
-        const bearing = (Math.atan2(y, x) * 180) / Math.PI;
-        return { distance, bearing: (bearing + 360) % 360 };
-      }
-
-      function getRelativeDirection(userHeading, bearingToTarget) {
-        const relative = (bearingToTarget - userHeading + 360) % 360;
-        if (relative >= 315 || relative < 45) {
-          return "forward";
-        }
-        if (relative < 135) {
-          return "right";
-        }
-        if (relative < 225) {
-          return "back";
-        }
-        return "left";
-      }
-
-      function directionLabel(direction) {
-        return {
-          forward: "Head forward",
-          back: "Head back",
-          left: "Head left",
-          right: "Head right",
-        }[direction];
-      }
-
-      function publishNavUpdate(payload) {
-        try {
-          if (typeof BroadcastChannel !== "undefined") {
-            const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
-            navChannel.postMessage(payload);
-            navChannel.close();
-          }
-        } catch (error) {
-          // Ignore channel errors on older browsers.
-        }
-      }
-
-      function refreshNearestTarget(userLat, userLon) {
-        let nearest = null;
-        let nearestDistance = Infinity;
-        MAP_CONFIG.grid_points.forEach((point) => {
-          if (skippedPoints.has(point.point)) {
-            return;
-          }
-          const { distance } = getDistanceAndBearing(
-            userLat,
-            userLon,
-            point.lat,
-            point.lon
-          );
-          if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearest = point;
-          }
-        });
-
-        const nextTarget = nearest ? nearest.point : null;
-        const nextLat = nearest ? nearest.lat : null;
-        const nextLon = nearest ? nearest.lon : null;
-        if (
-          nextTarget !== MAP_CONFIG.target_point ||
-          nextLat !== MAP_CONFIG.target_lat ||
-          nextLon !== MAP_CONFIG.target_lon
-        ) {
-          MAP_CONFIG.target_point = nextTarget;
-          MAP_CONFIG.target_lat = nextLat;
-          MAP_CONFIG.target_lon = nextLon;
-          drawGridMarkers();
-        }
-      }
-
-      function updateNavigationHud() {
-        const readout = document.getElementById("nav-readout");
-        if (!readout) {
-          return;
-        }
-
-        const userLat = Number(MAP_CONFIG.user_lat);
-        const userLon = Number(MAP_CONFIG.user_lon);
-        const toleranceM = Number(MAP_CONFIG.reach_tolerance_m);
-        const reachTol =
-          Number.isFinite(toleranceM) && toleranceM > 0 ? toleranceM : 0.015;
-
-        if (!Number.isFinite(userLat) || !Number.isFinite(userLon)) {
-          readout.textContent = "Waiting for RTK position from the receiver...";
-          readout.className = "nav-readout";
-          publishNavUpdate({
-            distance: null,
-            relative_bearing: null,
-            direction: null,
-            reached: false,
-            tolerance_m: reachTol,
-          });
-          return;
-        }
-
-        refreshNearestTarget(userLat, userLon);
-
-        const targetLat = Number(MAP_CONFIG.target_lat);
-        const targetLon = Number(MAP_CONFIG.target_lon);
-        const targetName = MAP_CONFIG.target_point;
-
-        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) {
-          const anyActive = MAP_CONFIG.grid_points.some(
-            (point) => !skippedPoints.has(point.point)
-          );
-          readout.textContent = anyActive
-            ? "No grid points available."
-            : "All grid points skipped — tap a yellow point to include it again.";
-          readout.className = "nav-readout";
-          publishNavUpdate({
-            distance: null,
-            relative_bearing: null,
-            direction: null,
-            reached: false,
-            target: null,
-            accuracy: MAP_CONFIG.user_accuracy,
-            tolerance_m: reachTol,
-          });
-          return;
-        }
-
-        const { distance, bearing } = getDistanceAndBearing(
-          userLat,
-          userLon,
-          targetLat,
-          targetLon
-        );
-
-        if (distance < reachTol) {
-          const tolCm = (reachTol * 100).toFixed(reachTol * 100 < 10 ? 1 : 0);
-          readout.textContent = `${targetName} REACHED (within ${tolCm} cm)!`;
-          readout.className = "nav-readout reached";
-          publishNavUpdate({
-            distance: 0,
-            relative_bearing: 0,
-            direction: "forward",
-            reached: true,
-            target: targetName,
-            accuracy: MAP_CONFIG.user_accuracy,
-            tolerance_m: reachTol,
-          });
-          return;
-        }
-
-        const accuracy = Number(MAP_CONFIG.user_accuracy);
-        let accuracyNote = "";
-        if (Number.isFinite(accuracy) && accuracy > 5) {
-          accuracyNote = " · GPS accuracy is low";
-          readout.className = "nav-readout warn";
-        } else {
-          readout.className = "nav-readout";
-        }
-
-        const heading = Number(MAP_CONFIG.user_heading);
-        if (!Number.isFinite(heading)) {
-          const headingHint = {
-            insecure: "open the app over HTTPS for compass directions",
-            desktop: "compass not available on desktop",
-            "no-compass": "compass not available on this device",
-          }[sensorIssue] || "tap Enable compass for directions";
-          readout.textContent =
-            `${distance.toFixed(2)} m to ${targetName} · ${headingHint}` +
-            accuracyNote;
-          publishNavUpdate({
-            distance,
-            relative_bearing: null,
-            direction: null,
-            reached: false,
-            target: targetName,
-            accuracy,
-            sensorIssue,
-            tolerance_m: reachTol,
-          });
-          return;
-        }
-
-        const direction = getRelativeDirection(heading, bearing);
-        const relativeBearing = (bearing - heading + 360) % 360;
-        readout.textContent =
-          `${directionLabel(direction)} · ${distance.toFixed(2)} m to ${targetName}` +
-          accuracyNote;
-        publishNavUpdate({
-          distance,
-          relative_bearing: relativeBearing,
-          direction,
-          reached: false,
-          target: targetName,
-          accuracy,
-          tolerance_m: reachTol,
-        });
-      }
-
-      function makeDotIcon(color, radius, fillOpacity) {
-        const diameter = radius * 2;
-        const size = diameter + 4;
-        return L.divIcon({
-          className: "gps-stick-dot-icon",
-          iconSize: [size, size],
-          iconAnchor: [size / 2, size / 2],
-          html:
-            `<div class="gps-stick-dot" style="` +
-            `width:${diameter}px;height:${diameter}px;` +
-            `margin:2px;background:${color};border-color:${color};` +
-            `opacity:${fillOpacity};"></div>`,
-        });
-      }
-
-      function screenUpBearing() {
-        if (!map || typeof map.getBearing !== "function") {
-          return 0;
-        }
-        const bearing = Number(map.getBearing());
-        if (!Number.isFinite(bearing)) {
-          return 0;
-        }
-        return (360 - (((bearing % 360) + 360) % 360)) % 360;
-      }
-
-      function makeConeIcon(screenRotDeg) {
-        // Apex at bottom-center sits on the user dot; the cone opens upward
-        // (screen +Y at rotation 0) in the facing direction.
-        return L.divIcon({
-          className: "gps-stick-cone-icon",
-          iconSize: [40, 48],
-          iconAnchor: [20, 46],
-          html:
-            `<div class="gps-stick-cone-wrap" style="transform:rotate(${screenRotDeg}deg)">` +
-            `<svg width="40" height="48" viewBox="0 0 40 48" aria-hidden="true">` +
-            `<polygon points="20,46 36,2 4,2" fill="rgba(255,68,68,0.35)" ` +
-            `stroke="#FF4444" stroke-width="1"></polygon></svg></div>`,
-        });
-      }
-
-      const gridMarkersByPoint = new Map();
-      // Yellow / skipped points are ignored when choosing the nearest target.
-      const skippedPoints = new Set();
-      let userDotMarker = null;
-      let facingConeMarker = null;
-      let zoomGestureActive = false;
-      let userDrawDeferred = false;
-      let pointToastTimer = null;
-
-      function mapBusyWithZoom() {
-        return zoomGestureActive || !!(map && map._animatingZoom);
-      }
-
-      function showPointToast(text) {
-        const el = document.getElementById("point-toast");
-        if (!el) {
-          return;
-        }
-        el.textContent = text;
-        el.classList.add("visible");
-        clearTimeout(pointToastTimer);
-        pointToastTimer = setTimeout(() => {
-          el.classList.remove("visible");
-        }, 1000);
-      }
-
-      function toggleSkippedPoint(pointName) {
-        if (skippedPoints.has(pointName)) {
-          skippedPoints.delete(pointName);
-          showPointToast(`${pointName} included again`);
-        } else {
-          skippedPoints.add(pointName);
-          showPointToast(`${pointName} excluded`);
-          if (MAP_CONFIG.target_point === pointName) {
-            MAP_CONFIG.target_point = null;
-            MAP_CONFIG.target_lat = null;
-            MAP_CONFIG.target_lon = null;
-          }
-        }
-        drawGridMarkers();
-        updateNavigationHud();
-      }
-
-      function drawGridMarkers() {
-        const keep = new Set(
-          MAP_CONFIG.grid_points.map((point) => point.point)
-        );
-        gridMarkersByPoint.forEach((marker, pointName) => {
-          if (!keep.has(pointName)) {
-            map.removeLayer(marker);
-            gridMarkersByPoint.delete(pointName);
-          }
-        });
-        if (
-          MAP_CONFIG.target_point != null &&
-          !keep.has(MAP_CONFIG.target_point)
-        ) {
-          MAP_CONFIG.target_point = null;
-          MAP_CONFIG.target_lat = null;
-          MAP_CONFIG.target_lon = null;
-        }
-        MAP_CONFIG.grid_points.forEach((point) => {
-          const skipped = skippedPoints.has(point.point);
-          const isTarget =
-            !skipped && point.point === MAP_CONFIG.target_point;
-          let color;
-          let radius;
-          let fillOpacity;
-          let zIndex;
-          if (skipped) {
-            color = "#FFD600";
-            radius = 7;
-            fillOpacity = 0.9;
-            zIndex = 300;
-          } else if (isTarget) {
-            color = "#00FF00";
-            radius = 9;
-            fillOpacity = 0.9;
-            zIndex = 400;
-          } else {
-            color = "#1E90FF";
-            radius = 6;
-            fillOpacity = 0.45;
-            zIndex = 200;
-          }
-          const icon = makeDotIcon(color, radius, fillOpacity);
-          let marker = gridMarkersByPoint.get(point.point);
-          if (!marker) {
-            marker = L.marker([point.lat, point.lon], {
-              icon,
-              keyboard: false,
-              zIndexOffset: zIndex,
-            })
-              .on("click", (event) => {
-                L.DomEvent.stopPropagation(event);
-                toggleSkippedPoint(point.point);
-              })
-              .addTo(map);
-            gridMarkersByPoint.set(point.point, marker);
-          } else {
-            marker.setLatLng([point.lat, point.lon]);
-            marker.setIcon(icon);
-            marker.setZIndexOffset(zIndex);
-          }
-        });
-      }
-
-      // Cumulative CSS angle for the cone. Tracking the shortest-path delta
-      // (instead of a raw 0-360 value) keeps the CSS transition from spinning
-      // the long way around when the heading crosses north.
-      let coneScreenRotCum = null;
-
-      function updateFacingCone() {
-        const heading = Number(MAP_CONFIG.user_heading);
-        const lat = Number(MAP_CONFIG.user_lat);
-        const lon = Number(MAP_CONFIG.user_lon);
-        if (
-          !Number.isFinite(heading) ||
-          !Number.isFinite(lat) ||
-          !Number.isFinite(lon)
-        ) {
-          if (facingConeMarker) {
-            map.removeLayer(facingConeMarker);
-            facingConeMarker = null;
-            coneScreenRotCum = null;
-          }
-          return;
-        }
-        // When the map follows heading, screen-up == facing, so the cone
-        // points straight up on screen. Otherwise CSS rotate (clockwise)
-        // is heading relative to geographic screen-up.
-        const target = followHeading
-          ? 0
-          : (heading - screenUpBearing() + 360) % 360;
-        if (!facingConeMarker) {
-          coneScreenRotCum = target;
-          facingConeMarker = L.marker([lat, lon], {
-            icon: makeConeIcon(target),
-            interactive: false,
-            keyboard: false,
-            zIndexOffset: 550,
-          }).addTo(map);
-          return;
-        }
-        facingConeMarker.setLatLng([lat, lon]);
-        const currentMod = ((coneScreenRotCum % 360) + 360) % 360;
-        coneScreenRotCum += ((target - currentMod + 540) % 360) - 180;
-        const el = facingConeMarker.getElement();
-        const wrap = el && el.querySelector(".gps-stick-cone-wrap");
-        if (wrap) {
-          // Mutate the existing element so the CSS transition animates the
-          // turn; setIcon would replace the DOM node and jump instead.
-          wrap.style.transform = `rotate(${coneScreenRotCum}deg)`;
-        } else {
-          facingConeMarker.setIcon(makeConeIcon(target));
-        }
-      }
-
-      function drawUserMarker() {
-        if (mapBusyWithZoom()) {
-          // setLatLng mid-zoom animation drifts markers; apply after zoomend.
-          userDrawDeferred = true;
-          return;
-        }
-        const lat = Number(MAP_CONFIG.user_lat);
-        const lon = Number(MAP_CONFIG.user_lon);
-        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-          return;
-        }
-        const icon = makeDotIcon("#FF0000", 7, 1.0);
-        if (!userDotMarker) {
-          userDotMarker = L.marker([lat, lon], {
-            icon,
-            keyboard: false,
-            zIndexOffset: 600,
-          })
-            .bindPopup("Your position")
-            .addTo(map);
-        } else {
-          userDotMarker.setLatLng([lat, lon]);
-          userDotMarker.setIcon(icon);
-        }
-        updateFacingCone();
-        updateNavigationHud();
-      }
-
-      // Heading filter state. Android fires BOTH deviceorientationabsolute
-      // (true north) and plain deviceorientation (relative, arbitrary zero);
-      // mixing them makes the heading jump. Once an absolute source is seen,
-      // relative readings are discarded.
-      let hasAbsoluteHeading = false;
-      let headingSin = null;
-      let headingCos = null;
-      let headingFilterReady = false;
-      let headingRefreshTimer = null;
-      let mapBearingTimer = null;
-      let lastAppliedMapBearing = null;
-      // Higher = snappier (closer to raw). Still an EMA on sin/cos so wrap and
-      // magnetometer jitter stay filtered instead of driving the UI raw.
-      const HEADING_SMOOTHING = 0.35;
-      // Cone + nav arrow refresh (~10 Hz). Map follow stays on its own ~30 fps
-      // loop. Latency came mostly from the old 0.5 Hz UI sample + 1.8s CSS ease.
-      const HEADING_REFRESH_MS = 100;
-      const MAP_BEARING_MS = 1000 / 30;
-      // Ignore stillness wiggle, but start tracking real turns sooner than 3°.
-      const HEADING_DEADBAND_DEG = 1.5;
-      // Tiny map deadband so 30 fps still feels continuous but skips noise.
-      const MAP_BEARING_DEADBAND_DEG = 0.35;
-
-      function getSmoothedHeading() {
-        if (!headingFilterReady) {
-          return null;
-        }
-        return (
-          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360
-        );
-      }
-
-      function applyConeHeading() {
-        const smoothed = getSmoothedHeading();
-        if (smoothed == null) {
-          return;
-        }
-        const previous = Number(MAP_CONFIG.user_heading);
-        if (Number.isFinite(previous)) {
-          const delta = Math.abs(((smoothed - previous + 540) % 360) - 180);
-          if (delta < HEADING_DEADBAND_DEG) {
-            return;
-          }
-        }
-        MAP_CONFIG.user_heading = smoothed;
-        // Map bearing is driven by the 30 fps loop when followHeading is on.
-        drawUserMarker();
-      }
-
-      function applyMapBearing() {
-        if (
-          !followHeading ||
-          !map ||
-          typeof map.setBearing !== "function" ||
-          mapBusyWithZoom()
-        ) {
-          return;
-        }
-        const smoothed = getSmoothedHeading();
-        if (smoothed == null) {
-          return;
-        }
-        if (lastAppliedMapBearing != null) {
-          const delta = Math.abs(
-            ((smoothed - lastAppliedMapBearing + 540) % 360) - 180
-          );
-          if (delta < MAP_BEARING_DEADBAND_DEG) {
-            return;
-          }
-        }
-        lastAppliedMapBearing = smoothed;
-        // leaflet-rotate pane angle is opposite screen-up; put heading at top.
-        map.setBearing((360 - smoothed) % 360);
-      }
-
-      function startHeadingRefreshTimer() {
-        if (headingRefreshTimer != null) {
-          return;
-        }
-        applyConeHeading();
-        headingRefreshTimer = setInterval(applyConeHeading, HEADING_REFRESH_MS);
-      }
-
-      function stopHeadingRefreshTimer() {
-        if (headingRefreshTimer != null) {
-          clearInterval(headingRefreshTimer);
-          headingRefreshTimer = null;
-        }
-      }
-
-      function startMapBearingTimer() {
-        if (mapBearingTimer != null) {
-          return;
-        }
-        lastAppliedMapBearing = null;
-        applyMapBearing();
-        mapBearingTimer = setInterval(applyMapBearing, MAP_BEARING_MS);
-      }
-
-      function stopMapBearingTimer() {
-        if (mapBearingTimer != null) {
-          clearInterval(mapBearingTimer);
-          mapBearingTimer = null;
-        }
-        lastAppliedMapBearing = null;
-      }
-
-      function updateFollowToggleUi() {
-        const btn = document.getElementById("follow-toggle");
-        if (!btn) {
-          return;
-        }
-        btn.classList.toggle("active", followHeading);
-        if (followHeading) {
-          btn.textContent = "Map: follows heading";
-          btn.title = "Map rotates so the direction you face is always up";
-        } else {
-          btn.textContent = "Map: free rotate";
-          btn.title =
-            "Map stays where you leave it; rotate with two fingers. Cone shows heading.";
-        }
-      }
-
-      function setFollowHeading(enabled) {
-        followHeading = !!enabled;
-        if (map) {
-          if (followHeading) {
-            if (map.touchRotate && map.touchRotate.disable) {
-              map.touchRotate.disable();
-            }
-            if (map.shiftKeyRotate && map.shiftKeyRotate.disable) {
-              map.shiftKeyRotate.disable();
-            }
-            startMapBearingTimer();
-          } else {
-            stopMapBearingTimer();
-            if (map.touchRotate && map.touchRotate.enable) {
-              map.touchRotate.enable();
-            }
-            if (map.shiftKeyRotate && map.shiftKeyRotate.enable) {
-              map.shiftKeyRotate.enable();
-            }
-          }
-          if (map.compassBearing) {
-            map.compassBearing._enabled = followHeading;
-            map.fire("rotate");
-          }
-        }
-        updateFollowToggleUi();
-        updateFacingCone();
-      }
-
-      function extractHeading(event) {
-        // iOS Safari: true compass heading, already in degrees from north.
-        if (
-          event.webkitCompassHeading != null &&
-          Number.isFinite(event.webkitCompassHeading)
-        ) {
-          return { heading: event.webkitCompassHeading, absolute: true };
-        }
-        if (event.alpha != null && Number.isFinite(event.alpha)) {
-          const absolute =
-            event.absolute === true || event.type === "deviceorientationabsolute";
-          return { heading: (360 - event.alpha) % 360, absolute };
-        }
-        return null;
-      }
-
-      function onDeviceOrientation(event) {
-        orientationEventSeen = true;
-        if (sensorIssue === "no-compass") {
-          sensorIssue = null;
-        }
-
-        const reading = extractHeading(event);
-        if (reading == null) {
-          return;
-        }
-
-        if (reading.absolute) {
-          hasAbsoluteHeading = true;
-        } else if (hasAbsoluteHeading) {
-          // A north-referenced source exists; ignore relative readings.
-          return;
-        }
-
-        // Low-pass filter on the heading's unit vector. Filtering sin/cos
-        // instead of degrees handles the 359°->0° wraparound correctly and
-        // absorbs magnetometer jitter.
-        const rad = (reading.heading * Math.PI) / 180;
-        if (headingSin == null) {
-          headingSin = Math.sin(rad);
-          headingCos = Math.cos(rad);
-        } else {
-          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
-          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
-        }
-        headingFilterReady = true;
-      }
-
-      async function requestOrientationPermission() {
-        if (
-          typeof DeviceOrientationEvent !== "undefined" &&
-          typeof DeviceOrientationEvent.requestPermission === "function"
-        ) {
-          const response = await DeviceOrientationEvent.requestPermission();
-          return response === "granted";
-        }
-        return true;
-      }
-
-      function startCompass() {
-        // Android Chrome delivers true-north headings via the "absolute"
-        // event; iOS Safari only fires plain deviceorientation (with
-        // webkitCompassHeading). Listen to both and let whichever fires win.
-        if ("ondeviceorientationabsolute" in window) {
-          window.addEventListener(
-            "deviceorientationabsolute",
-            onDeviceOrientation,
-            true
-          );
-        }
-        window.addEventListener("deviceorientation", onDeviceOrientation, true);
-        startHeadingRefreshTimer();
-
-        setTimeout(() => {
-          if (!orientationEventSeen && sensorIssue == null) {
-            showSensorWarning(
-              "no-compass",
-              "No compass data is coming from this device. Distance still works, but facing direction will be unavailable."
-            );
-          }
-        }, 4000);
-      }
-
-      async function enableClientSensors() {
-        try {
-          const orientationGranted = await requestOrientationPermission();
-          if (!orientationGranted) {
-            const readout = document.getElementById("nav-readout");
-            if (readout) {
-              readout.textContent =
-                "Compass permission denied. You can still see distance, but not facing direction.";
-              readout.className = "nav-readout warn";
-            }
-          }
-        } catch (error) {
-          // Still attach listeners; some browsers fire events without the prompt.
-        }
-        startCompass();
-      }
-
-      function handleMapMessage(data) {
-        if (!data || data.type !== MAP_MESSAGE_TYPE || !map) {
-          return;
-        }
-
-        if (data.action === "updateUser") {
-          const nextLat = Number(data.user_lat);
-          const nextLon = Number(data.user_lon);
-          if (
-            !Number.isFinite(nextLat) ||
-            !Number.isFinite(nextLon) ||
-            (nextLat === MAP_CONFIG.user_lat && nextLon === MAP_CONFIG.user_lon)
-          ) {
-            return;
-          }
-          MAP_CONFIG.user_lat = nextLat;
-          MAP_CONFIG.user_lon = nextLon;
-          drawUserMarker();
-          return;
-        }
-
-        if (data.action === "updateGridPoints") {
-          const points = Array.isArray(data.grid_points) ? data.grid_points : [];
-          MAP_CONFIG.grid_points = points
-            .map((point) => ({
-              point: String(point.point),
-              lat: Number(point.lat),
-              lon: Number(point.lon),
-            }))
-            .filter(
-              (point) =>
-                point.point &&
-                Number.isFinite(point.lat) &&
-                Number.isFinite(point.lon)
-            );
-          drawGridMarkers();
-          updateNavigationHud();
-        }
-      }
-
-      map = L.map("map", {
-        center: [MAP_CONFIG.center_lat, MAP_CONFIG.center_lon],
-        zoom: MAP_CONFIG.zoom,
-        zoomControl: true,
-        maxZoom: 25,
-        rotate: true,
-        bearing: 0,
-        touchRotate: true,
-        shiftKeyRotate: true,
-        rotateControl: {
-          closeOnZeroBearing: false,
-          position: "topleft",
-        },
-      });
-
-      // Drive "compass follow" from our own heading filter (handles iOS/Android
-      // quirks). Hijack the plugin handler so the rotate control's orange
-      // compass mode toggles followHeading instead of attaching a second listener.
-      if (map.compassBearing) {
-        map.compassBearing.enable = function () {
-          setFollowHeading(true);
-          return this;
-        };
-        map.compassBearing.disable = function () {
-          setFollowHeading(false);
-          return this;
-        };
-        map.compassBearing.enabled = function () {
-          return !!followHeading;
-        };
-      }
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "&copy; OpenStreetMap contributors",
-        maxZoom: 25,
-        maxNativeZoom: 19,
-      }).addTo(map);
-
-      L.control
-        .scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 120 })
-        .addTo(map);
-
-      // Markers (DivIcon) sit on leaflet-rotate's norotate pane and stay locked
-      // to lat/lng during zoom/rotate. SVG circleMarkers on overlayPane drift.
-      drawGridMarkers();
-      drawUserMarker();
-
-      map.on("zoomstart", () => {
-        zoomGestureActive = true;
-      });
-      map.on("zoomend", () => {
-        zoomGestureActive = false;
-        gridMarkersByPoint.forEach((marker) => marker.update());
-        if (userDotMarker) {
-          userDotMarker.update();
-        }
-        if (facingConeMarker) {
-          facingConeMarker.update();
-        }
-        if (userDrawDeferred) {
-          userDrawDeferred = false;
-          drawUserMarker();
-        } else {
-          updateFacingCone();
-        }
-      });
-      map.on("rotate", () => {
-        // In follow mode the cone stays screen-up (target 0) and the map
-        // turns underneath at 30 fps — skip cone work on every rotate tick.
-        if (!mapBusyWithZoom() && !followHeading) {
-          updateFacingCone();
-        }
-      });
-
-      // Browsers remove geolocation and orientation APIs entirely on plain
-      // HTTP (except localhost), so check the secure context before blaming
-      // the device type.
-      if (!window.isSecureContext) {
-        showSensorWarning(
-          "insecure",
-          "This page is served over HTTP, so the browser blocks compass access. Position from the RTK receiver still works, but open the app via HTTPS for facing direction."
-        );
-      } else if (isLikelyDesktop()) {
-        showSensorWarning(
-          "desktop",
-          "Desktop browsers usually do not provide compass orientation. Use a phone or tablet to see which way you are facing and get forward/back/left/right directions."
-        );
-      }
-
-      document
-        .getElementById("follow-toggle")
-        .addEventListener("click", () => {
-          setFollowHeading(!followHeading);
-        });
-      updateFollowToggleUi();
-
-      try {
-        if (typeof BroadcastChannel !== "undefined") {
-          const gridChannel = new BroadcastChannel(MAP_MESSAGE_TYPE);
-          gridChannel.onmessage = (event) => {
-            handleMapMessage(event.data);
-          };
-          const navConfigChannel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
-          navConfigChannel.onmessage = (event) => {
-            const nextTol = Number(event.data && event.data.tolerance_m);
-            if (Number.isFinite(nextTol) && nextTol > 0) {
-              MAP_CONFIG.reach_tolerance_m = nextTol;
-              updateNavigationHud();
-            }
-          };
-          // Compass is enabled from the Live Navigation panel (not a map
-          // overlay). Heading can arrive from that panel, or this iframe
-          // can start its own sensors when told to enable.
-          const headingChannel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
-          headingChannel.onmessage = (event) => {
-            const data = event.data || {};
-            if (data.action === "enableCompass") {
-              enableClientSensors();
-              return;
-            }
-            if (data.heading != null) {
-              applyExternalHeading(data.heading);
-            }
-          };
-        }
-      } catch (error) {
-        // Ignore channel errors on older browsers.
-      }
-
-      try {
-        if (window.parent.__gpsStickMapHandler) {
-          window.parent.removeEventListener(
-            "message",
-            window.parent.__gpsStickMapHandler
-          );
-        }
-        window.parent.__gpsStickMapHandler = (event) => {
-          handleMapMessage(event.data);
-        };
-        window.parent.addEventListener(
-          "message",
-          window.parent.__gpsStickMapHandler
-        );
-      } catch (error) {
-        // Ignore parent listener errors in restricted iframes.
-      }
-    </script>
-  </body>
-</html>
-"""
-
-
-_LIVE_NAV_PANEL_HTML = """<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <style>
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-        height: 100%;
-        font-family: sans-serif;
-        background: #f4f6f8;
-        color: #111;
-        color-scheme: light;
-      }
-
-      .panel {
-        box-sizing: border-box;
-        min-height: 100%;
-        padding: 16px 16px 12px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 10px;
-        background: #f4f6f8;
-        color: #111;
-      }
-
-      .arrow-wrap {
-        flex: 1 1 auto;
-        width: 100%;
-        min-height: 220px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        position: relative;
-      }
-
-      .arrow {
-        position: relative;
-        width: min(58vw, 220px);
-        height: min(72vw, 270px);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transform-origin: 50% 55%;
-        transition: transform 0.12s linear;
-      }
-
-      .arrow-svg {
-        position: relative;
-        width: 78%;
-        height: 88%;
-        overflow: visible;
-        filter: drop-shadow(0 10px 18px rgba(13, 71, 161, 0.35));
-        transition: filter 0.2s ease, opacity 0.2s ease;
-      }
-
-      .arrow-svg .arrow-body {
-        fill: url(#arrowFill);
-        stroke: #0d47a1;
-        stroke-width: 5;
-        stroke-linejoin: round;
-        stroke-linecap: round;
-      }
-
-      .arrow-svg .arrow-sheen {
-        fill: url(#arrowSheen);
-        opacity: 0.55;
-        pointer-events: none;
-      }
-
-      .arrow.disabled .arrow-svg {
-        filter: none;
-        opacity: 0.55;
-      }
-
-      .arrow.disabled .arrow-svg .arrow-body {
-        fill: #9e9e9e;
-        stroke: #757575;
-      }
-
-      .arrow.disabled .arrow-svg .arrow-sheen {
-        display: none;
-      }
-
-      .arrow.reached {
-        display: none;
-      }
-
-      .reached-mark {
-        display: none;
-        width: min(44vw, 140px);
-        height: min(44vw, 140px);
-        border-radius: 50%;
-        background: radial-gradient(circle at 40% 35%, #66bb6a, #1b5e20);
-        color: #fff;
-        font-size: min(22vw, 72px);
-        font-weight: 700;
-        line-height: 1;
-        align-items: center;
-        justify-content: center;
-        box-shadow: 0 12px 28px rgba(27, 94, 32, 0.35);
-      }
-
-      .reached-mark.visible {
-        display: flex;
-      }
-
-      .distance-block {
-        text-align: center;
-        width: 100%;
-      }
-
-      .distance-value {
-        font-size: 42px;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-        color: #111;
-        line-height: 1.1;
-      }
-
-      .status {
-        margin-top: 4px;
-        font-size: 15px;
-        color: #555;
-        text-align: center;
-        min-height: 1.2em;
-      }
-
-      .status.success {
-        color: #1b5e20;
-        font-weight: 600;
-      }
-
-      .status.warn {
-        color: #e65100;
-      }
-
-      .tolerance-row {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        font-size: 12px;
-        color: #777;
-        margin-top: 2px;
-      }
-
-      .tolerance-row input {
-        width: 64px;
-        padding: 4px 6px;
-        border: 1px solid rgba(0, 0, 0, 0.12);
-        border-radius: 6px;
-        font-size: 13px;
-        color: #444;
-        background: #fff;
-      }
-
-      .compass-row {
-        width: 100%;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        gap: 10px;
-      }
-
-      .compass-btn {
-        border: none;
-        border-radius: 10px;
-        padding: 12px 18px;
-        font: 15px/1.2 sans-serif;
-        font-weight: 700;
-        color: #fff;
-        background: #1565c0;
-        cursor: pointer;
-        box-shadow: 0 2px 8px rgba(21, 101, 192, 0.28);
-      }
-
-      .compass-btn:hover {
-        background: #0d47a1;
-      }
-
-      .compass-btn.enabled {
-        background: #2e7d32;
-        box-shadow: none;
-        cursor: default;
-      }
-
-      .compass-btn:disabled {
-        opacity: 0.7;
-        cursor: default;
-      }
-
-      .desktop-warn {
-        display: none;
-        width: 100%;
-        box-sizing: border-box;
-        text-align: center;
-        border-radius: 10px;
-        padding: 10px 12px;
-        font: 600 14px/1.35 sans-serif;
-        color: #e65100;
-        background: #fff3e0;
-        border: 1px solid rgba(230, 81, 0, 0.28);
-      }
-
-      .desktop-warn.visible {
-        display: block;
-      }
-
-      .fullscreen-btn {
-        border: 1px solid rgba(0, 0, 0, 0.15);
-        border-radius: 10px;
-        padding: 12px 14px;
-        font: 14px/1.2 sans-serif;
-        font-weight: 600;
-        color: #1565c0;
-        background: #fff;
-        cursor: pointer;
-      }
-
-      .fullscreen-btn:hover {
-        background: #e3f2fd;
-      }
-
-      .rtk-bar {
-        width: 100%;
-        box-sizing: border-box;
-        text-align: center;
-        border-radius: 10px;
-        padding: 10px 12px;
-        font: 600 15px/1.3 sans-serif;
-        letter-spacing: 0.01em;
-        border: 1px solid transparent;
-      }
-
-      .rtk-bar.unknown {
-        color: #555;
-        background: #eceff1;
-        border-color: rgba(0, 0, 0, 0.08);
-      }
-
-      .rtk-bar.none {
-        color: #b71c1c;
-        background: #ffebee;
-        border-color: rgba(183, 28, 28, 0.25);
-      }
-
-      .rtk-bar.float {
-        color: #e65100;
-        background: #fff3e0;
-        border-color: rgba(230, 81, 0, 0.28);
-      }
-
-      .rtk-bar.fix {
-        color: #1b5e20;
-        background: #e8f5e9;
-        border-color: rgba(27, 94, 32, 0.28);
-      }
-
-      .panel.is-fullscreen,
-      .panel:fullscreen,
-      .panel:-webkit-full-screen {
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        min-height: 100%;
-        border-radius: 0;
-        z-index: 9999;
-        justify-content: center;
-        /* Force light surface: some phones paint a black fullscreen
-           backdrop while our distance text stays dark (#111). */
-        background: #f4f6f8 !important;
-        color: #111 !important;
-        color-scheme: light;
-      }
-
-      .panel.is-fullscreen .rtk-bar,
-      .panel:fullscreen .rtk-bar,
-      .panel:-webkit-full-screen .rtk-bar {
-        font-size: 18px;
-        padding: 12px 14px;
-      }
-
-      .panel.is-fullscreen .arrow-wrap,
-      .panel:fullscreen .arrow-wrap,
-      .panel:-webkit-full-screen .arrow-wrap {
-        flex: 1 1 auto;
-        min-height: 0;
-      }
-
-      .panel.is-fullscreen .arrow,
-      .panel:fullscreen .arrow,
-      .panel:-webkit-full-screen .arrow {
-        width: min(90vw, 560px);
-        height: min(110vw, 680px);
-      }
-
-      .panel.is-fullscreen .reached-mark,
-      .panel:fullscreen .reached-mark,
-      .panel:-webkit-full-screen .reached-mark {
-        width: min(56vw, 220px);
-        height: min(56vw, 220px);
-        font-size: min(28vw, 96px);
-      }
-
-      .panel.is-fullscreen .distance-value,
-      .panel:fullscreen .distance-value,
-      .panel:-webkit-full-screen .distance-value {
-        color: #111 !important;
-        -webkit-text-fill-color: #111;
-        font-size: 64px;
-      }
-
-      .panel.is-fullscreen .distance-block,
-      .panel:fullscreen .distance-block,
-      .panel:-webkit-full-screen .distance-block {
-        color: #111;
-      }
-
-      .panel.is-fullscreen .status,
-      .panel:fullscreen .status,
-      .panel:-webkit-full-screen .status {
-        color: #444 !important;
-      }
-
-      .panel.is-fullscreen .tolerance-row,
-      .panel:fullscreen .tolerance-row,
-      .panel:-webkit-full-screen .tolerance-row {
-        color: #555 !important;
-      }
-
-      .panel.is-fullscreen .tolerance-row input,
-      .panel:fullscreen .tolerance-row input,
-      .panel:-webkit-full-screen .tolerance-row input {
-        color: #222 !important;
-        background: #fff !important;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="panel" id="nav-panel">
-      <div class="compass-row">
-        <button id="enable-compass" class="compass-btn" type="button">
-          Enable compass
-        </button>
-        <button
-          id="fullscreen-btn"
-          class="fullscreen-btn"
-          type="button"
-          title="Expand the navigation arrow"
-        >
-          Fullscreen
-        </button>
-      </div>
-      <div id="desktop-warn" class="desktop-warn" role="status" aria-live="polite">
-        Open this page on a phone or tablet to get compass heading. Distance still works on desktop.
-      </div>
-      <div id="rtk-bar" class="rtk-bar unknown" role="status" aria-live="polite">
-        Waiting for GPS…
-      </div>
-      <div class="arrow-wrap" title="Direction to target relative to the way you are facing">
-        <div id="nav-arrow" class="arrow disabled">
-          <svg
-            class="arrow-svg"
-            viewBox="0 0 200 280"
-            xmlns="http://www.w3.org/2000/svg"
-            aria-hidden="true"
-          >
-            <defs>
-              <linearGradient id="arrowFill" x1="100" y1="16" x2="100" y2="268" gradientUnits="userSpaceOnUse">
-                <stop offset="0%" stop-color="#42a5f5" />
-                <stop offset="45%" stop-color="#1e88e5" />
-                <stop offset="100%" stop-color="#0d47a1" />
-              </linearGradient>
-              <linearGradient id="arrowSheen" x1="70" y1="40" x2="130" y2="220" gradientUnits="userSpaceOnUse">
-                <stop offset="0%" stop-color="#ffffff" stop-opacity="0.55" />
-                <stop offset="55%" stop-color="#ffffff" stop-opacity="0.08" />
-                <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
-              </linearGradient>
-            </defs>
-            <!-- Classic navigation arrow: tip, wings, tapered shaft -->
-            <path
-              class="arrow-body"
-              d="M100 18
-                 L178 118
-                 L142 118
-                 L142 250
-                 Q142 266 126 266
-                 L74 266
-                 Q58 266 58 250
-                 L58 118
-                 L22 118
-                 Z"
-            />
-            <path
-              class="arrow-sheen"
-              d="M100 34
-                 L150 108
-                 L128 108
-                 L128 240
-                 L100 240
-                 Z"
-            />
-          </svg>
-        </div>
-        <div id="reached-mark" class="reached-mark">✓</div>
-      </div>
-      <div class="distance-block">
-        <div id="distance-value" class="distance-value">--</div>
-        <div id="status-line" class="status">Tap Enable compass above, then follow the arrow. Position comes from the RTK receiver.</div>
-      </div>
-      <div class="tolerance-row">
-        <label for="tolerance-cm">Reach tolerance</label>
-        <input
-          id="tolerance-cm"
-          type="number"
-          min="0.5"
-          step="0.5"
-          value="1.5"
-        />
-        <span>cm</span>
-      </div>
-    </div>
-    <script>
-      const NAV_MESSAGE_TYPE = "gps-stick-nav";
-      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
-      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
-
-      // Cumulative CSS angle so 359°→0° takes the short path instead of
-      // spinning ~359° the long way around (0 and 360 are the same heading).
-      let arrowRotCum = null;
-      let compassEnabled = false;
-      let hasAbsoluteHeading = false;
-      let headingSin = null;
-      let headingCos = null;
-      let headingFilterReady = false;
-      let headingPublishTimer = null;
-      let orientationEventSeen = false;
-      // Sticky across BroadcastChannel updates so desktop/insecure warnings
-      // are not wiped by distance-only payloads from the field map.
-      let panelSensorIssue = null;
-      const HEADING_SMOOTHING = 0.35;
-      const HEADING_PUBLISH_MS = 100;
-
-      function setArrowRotation(degrees) {
-        const arrow = document.getElementById("nav-arrow");
-        if (!arrow) {
-          return;
-        }
-        if (!Number.isFinite(degrees)) {
-          arrowRotCum = null;
-          arrow.style.transform = "rotate(0deg)";
-          return;
-        }
-        const target = ((Number(degrees) % 360) + 360) % 360;
-        if (arrowRotCum == null) {
-          arrowRotCum = target;
-        } else {
-          const currentMod = ((arrowRotCum % 360) + 360) % 360;
-          arrowRotCum += ((target - currentMod + 540) % 360) - 180;
-        }
-        arrow.style.transform = `rotate(${arrowRotCum}deg)`;
-      }
-
-      function formatDistance(meters) {
-        if (meters == null || !Number.isFinite(Number(meters))) {
-          return "--";
-        }
-        return `${Number(meters).toFixed(2)} m`;
-      }
-
-      function publishTolerance() {
-        const input = document.getElementById("tolerance-cm");
-        const cm = Number(input && input.value);
-        if (!Number.isFinite(cm) || cm <= 0) {
-          return;
-        }
-        try {
-          if (typeof BroadcastChannel !== "undefined") {
-            const channel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
-            channel.postMessage({ tolerance_m: cm / 100 });
-            channel.close();
-          }
-        } catch (error) {
-          // Ignore channel errors on older browsers.
-        }
-      }
-
-      function publishHeading(heading) {
-        try {
-          if (typeof BroadcastChannel !== "undefined") {
-            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
-            channel.postMessage({ heading: Number(heading) });
-            channel.close();
-          }
-        } catch (error) {
-          // Ignore channel errors on older browsers.
-        }
-      }
-
-      function requestMapEnableCompass() {
-        try {
-          if (typeof BroadcastChannel !== "undefined") {
-            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
-            channel.postMessage({ action: "enableCompass" });
-            channel.close();
-          }
-        } catch (error) {
-          // Ignore channel errors on older browsers.
-        }
-      }
-
-      function extractHeading(event) {
-        if (
-          event.webkitCompassHeading != null &&
-          Number.isFinite(event.webkitCompassHeading)
-        ) {
-          return { heading: event.webkitCompassHeading, absolute: true };
-        }
-        if (event.alpha != null && Number.isFinite(event.alpha)) {
-          const absolute =
-            event.absolute === true || event.type === "deviceorientationabsolute";
-          return { heading: (360 - event.alpha) % 360, absolute };
-        }
-        return null;
-      }
-
-      function getSmoothedHeading() {
-        if (!headingFilterReady) {
-          return null;
-        }
-        return (
-          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360
-        );
-      }
-
-      function onDeviceOrientation(event) {
-        orientationEventSeen = true;
-        const reading = extractHeading(event);
-        if (reading == null) {
-          return;
-        }
-        if (reading.absolute) {
-          hasAbsoluteHeading = true;
-        } else if (hasAbsoluteHeading) {
-          return;
-        }
-        const rad = (reading.heading * Math.PI) / 180;
-        if (headingSin == null) {
-          headingSin = Math.sin(rad);
-          headingCos = Math.cos(rad);
-        } else {
-          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
-          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
-        }
-        headingFilterReady = true;
-      }
-
-      function startHeadingPublish() {
-        if (headingPublishTimer != null) {
-          return;
-        }
-        headingPublishTimer = setInterval(() => {
-          const heading = getSmoothedHeading();
-          if (heading == null) {
-            return;
-          }
-          publishHeading(heading);
-        }, HEADING_PUBLISH_MS);
-      }
-
-      async function requestOrientationPermission() {
-        if (
-          typeof DeviceOrientationEvent !== "undefined" &&
-          typeof DeviceOrientationEvent.requestPermission === "function"
-        ) {
-          const response = await DeviceOrientationEvent.requestPermission();
-          return response === "granted";
-        }
-        return true;
-      }
-
-      async function enableCompass() {
-        const button = document.getElementById("enable-compass");
-        const statusLine = document.getElementById("status-line");
-        try {
-          const granted = await requestOrientationPermission();
-          if (!granted) {
-            if (statusLine) {
-              statusLine.textContent =
-                "Compass permission denied. Distance still works without facing direction.";
-              statusLine.className = "status warn";
-            }
-            return;
-          }
-        } catch (error) {
-          // Continue; some browsers fire orientation without an explicit grant.
-        }
-
-        if ("ondeviceorientationabsolute" in window) {
-          window.addEventListener(
-            "deviceorientationabsolute",
-            onDeviceOrientation,
-            true
-          );
-        }
-        window.addEventListener("deviceorientation", onDeviceOrientation, true);
-        startHeadingPublish();
-        // Also ask the map iframe to enable its own sensors (cone / follow).
-        requestMapEnableCompass();
-
-        compassEnabled = true;
-        if (button) {
-          button.textContent = "Compass enabled";
-          button.classList.add("enabled");
-          button.disabled = true;
-        }
-        if (statusLine && statusLine.className.indexOf("success") < 0) {
-          statusLine.textContent =
-            "Compass enabled. Follow the arrow toward the nearest grid point.";
-          statusLine.className = "status";
-        }
-
-        setTimeout(() => {
-          if (!orientationEventSeen && statusLine) {
-            statusLine.textContent =
-              "No compass data is coming from this device. Distance still works.";
-            statusLine.className = "status warn";
-          }
-        }, 4000);
-      }
-
-      function updateRtkBar(payload) {
-        const bar = document.getElementById("rtk-bar");
-        if (!bar) {
-          return;
-        }
-        if (payload.rtk_label == null && payload.gps_qual == null) {
-          return;
-        }
-        let label = payload.rtk_label;
-        let cssClass = payload.rtk_class || "unknown";
-        if (!label) {
-          const qual = Number(payload.gps_qual);
-          if (qual === 4) {
-            label = "RTK Fix";
-            cssClass = "fix";
-          } else if (qual === 5) {
-            label = "RTK Float";
-            cssClass = "float";
-          } else if (Number.isFinite(qual)) {
-            label = "No RTK";
-            cssClass = "none";
-          } else {
-            label = "Waiting for GPS…";
-            cssClass = "unknown";
-          }
-        }
-        const sats = Number(payload.num_sats);
-        const satsNote =
-          Number.isFinite(sats) && sats > 0 ? ` · ${sats} sats` : "";
-        bar.textContent = `${label}${satsNote}`;
-        bar.className = `rtk-bar ${cssClass}`;
-      }
-
-      function updatePanel(payload) {
-        updateRtkBar(payload);
-
-        if (payload.sensorIssue) {
-          panelSensorIssue = payload.sensorIssue;
-        }
-        const activeSensorIssue = payload.sensorIssue || panelSensorIssue;
-
-        // Quality-only updates from Python skip the distance/arrow path.
-        if (
-          payload.distance === undefined &&
-          payload.relative_bearing === undefined &&
-          payload.reached === undefined &&
-          payload.sensorIssue === undefined &&
-          (payload.rtk_label != null || payload.gps_qual != null)
-        ) {
-          return;
-        }
-
-        const distanceValue = document.getElementById("distance-value");
-        const statusLine = document.getElementById("status-line");
-        const arrow = document.getElementById("nav-arrow");
-        const reachedMark = document.getElementById("reached-mark");
-        const targetSuffix = payload.target ? ` to ${payload.target}` : "";
-        const toleranceM = Number(payload.tolerance_m);
-        const tolCm = Number.isFinite(toleranceM)
-          ? (toleranceM * 100).toFixed(toleranceM * 100 < 10 ? 1 : 0)
-          : "1.5";
-        const hasDistance =
-          payload.distance != null && Number.isFinite(Number(payload.distance));
-
-        distanceValue.textContent = formatDistance(payload.distance);
-
-        if (payload.reached) {
-          arrow.classList.add("reached", "disabled");
-          reachedMark.classList.add("visible");
-          statusLine.textContent = `${payload.target || "TARGET"} REACHED (within ${tolCm} cm)!`;
-          statusLine.className = "status success";
-          return;
-        }
-
-        reachedMark.classList.remove("visible");
-        arrow.classList.remove("reached");
-
-        const bearing = Number(payload.relative_bearing);
-        if (Number.isFinite(bearing)) {
-          arrow.classList.remove("disabled");
-          setArrowRotation(bearing);
-          statusLine.textContent = `Target${targetSuffix}`;
-          statusLine.className = "status";
-        } else if (activeSensorIssue === "insecure") {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent = hasDistance
-            ? `${formatDistance(payload.distance)} to target · open over HTTPS for heading`
-            : "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
-          statusLine.className = "status warn";
-        } else if (activeSensorIssue === "desktop") {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent = hasDistance
-            ? `${formatDistance(payload.distance)}${targetSuffix} · use a phone or tablet for heading`
-            : "Desktop detected: use a phone or tablet for compass heading. Distance still works here.";
-          statusLine.className = "status warn";
-        } else if (activeSensorIssue === "no-compass") {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent =
-            "This device is not reporting compass data. Distance still works, but the heading arrow is unavailable.";
-          statusLine.className = "status warn";
-        } else if (payload.distance == null) {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent =
-            "Waiting for RTK position and an active grid target.";
-          statusLine.className = "status warn";
-        } else if (!compassEnabled) {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent =
-            "Tap Enable compass above for facing direction.";
-          statusLine.className = "status warn";
-        } else {
-          arrow.classList.add("disabled");
-          setArrowRotation(null);
-          statusLine.textContent =
-            "Waiting for compass heading from this device.";
-          statusLine.className = "status warn";
-        }
-
-        if (payload.accuracy != null && Number(payload.accuracy) > 5) {
-          statusLine.textContent += " GPS accuracy is low.";
-          statusLine.className = "status warn";
-        }
-      }
-
-      const toleranceInput = document.getElementById("tolerance-cm");
-      toleranceInput.addEventListener("change", publishTolerance);
-      toleranceInput.addEventListener("input", publishTolerance);
-      publishTolerance();
-
-      function isNativeFullscreen() {
-        return !!(
-          document.fullscreenElement ||
-          document.webkitFullscreenElement ||
-          document.msFullscreenElement
-        );
-      }
-
-      function updateFullscreenButton() {
-        const button = document.getElementById("fullscreen-btn");
-        const panel = document.getElementById("nav-panel");
-        if (!button || !panel) {
-          return;
-        }
-        const active = isNativeFullscreen() || panel.classList.contains("is-fullscreen");
-        button.textContent = active ? "Exit fullscreen" : "Fullscreen";
-      }
-
-      async function toggleFullscreen() {
-        const panel = document.getElementById("nav-panel");
-        if (!panel) {
-          return;
-        }
-
-        const active =
-          isNativeFullscreen() || panel.classList.contains("is-fullscreen");
-
-        // Prefer the browser Fullscreen API so the arrow can fill the phone.
-        // Always keep .is-fullscreen in sync so light background + larger arrow
-        // CSS apply even when the browser paints a dark fullscreen chrome.
-        if (active) {
-          try {
-            if (isNativeFullscreen()) {
-              const exit =
-                document.exitFullscreen ||
-                document.webkitExitFullscreen ||
-                document.msExitFullscreen;
-              if (exit) {
-                await exit.call(document);
-              }
-            }
-          } catch (error) {
-            // Ignore API failures; CSS class below still exits the fallback.
-          }
-          panel.classList.remove("is-fullscreen");
-        } else {
-          try {
-            const request =
-              panel.requestFullscreen ||
-              panel.webkitRequestFullscreen ||
-              panel.msRequestFullscreen;
-            if (request) {
-              await request.call(panel);
-            }
-          } catch (error) {
-            // Fall through to CSS-only fullscreen inside the iframe.
-          }
-          panel.classList.add("is-fullscreen");
-        }
-        updateFullscreenButton();
-      }
-
-      function onFullscreenChange() {
-        const panel = document.getElementById("nav-panel");
-        if (!panel) {
-          return;
-        }
-        if (isNativeFullscreen()) {
-          panel.classList.add("is-fullscreen");
-        } else {
-          panel.classList.remove("is-fullscreen");
-        }
-        updateFullscreenButton();
-      }
-
-      document
-        .getElementById("fullscreen-btn")
-        .addEventListener("click", toggleFullscreen);
-      document.addEventListener("fullscreenchange", onFullscreenChange);
-      document.addEventListener("webkitfullscreenchange", onFullscreenChange);
-
-      try {
-        if (typeof BroadcastChannel !== "undefined") {
-          const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
-          navChannel.onmessage = (event) => {
-            updatePanel(event.data || {});
-          };
-        }
-      } catch (error) {
-        // Ignore channel errors on older browsers.
-      }
-
-      (function initCompassUi() {
-        const button = document.getElementById("enable-compass");
-        const desktopWarn = document.getElementById("desktop-warn");
-        const ua = navigator.userAgent || "";
-        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
-        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
-        const desktop = !mobile && !hasTouch;
-
-        if (!window.isSecureContext) {
-          if (button) {
-            button.style.display = "none";
-          }
-          updatePanel({ sensorIssue: "insecure" });
-          return;
-        }
-        if (desktop) {
-          // No device compass on desktop — hide the control, keep a clear warning.
-          if (button) {
-            button.style.display = "none";
-          }
-          if (desktopWarn) {
-            desktopWarn.classList.add("visible");
-          }
-          updatePanel({ sensorIssue: "desktop" });
-          return;
-        }
-        if (desktopWarn) {
-          desktopWarn.classList.remove("visible");
-        }
-        if (button) {
-          button.addEventListener("click", enableCompass);
-        }
-      })();
-    </script>
-  </body>
-</html>
-"""
-
-
 def _encode_map_payload(payload):
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@st.cache_resource
+def _load_static_html(name: str, mtime: float) -> str:
+    """Load large HTML templates once per process (mtime busts stale cache)."""
+    return (_STATIC_DIR / name).read_text(encoding="utf-8")
+
+
+def _static_html(name: str) -> str:
+    path = _STATIC_DIR / name
+    return _load_static_html(name, path.stat().st_mtime)
+
+
+def _app_shell_css() -> str:
+    """Parent-page CSS only (Streamlit strips <script> from markdown HTML)."""
+    return """
+    <style>
+    [data-testid="stElementContainer"][data-stale="true"]:has(iframe.stCustomComponentV1) {
+        opacity: 1 !important;
+    }
+    /* Keep the sidebar collapse chevron visible (not hover-only). */
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarCollapseButton"] button {
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto !important;
+    }
+    [data-testid="stSidebarHeader"] {
+        opacity: 1 !important;
+    }
+    /* Clearer expand control when the sidebar is collapsed. */
+    [data-testid="stSidebarCollapsedControl"] {
+        opacity: 1 !important;
+        z-index: 1000 !important;
+    }
+    /* Safari iOS zooms focused inputs under 16px — keep form text at 16px. */
+    input, textarea, select,
+    [data-baseweb="input"] input,
+    [data-baseweb="textarea"] textarea,
+    [data-baseweb="select"],
+    .stTextInput input,
+    .stNumberInput input,
+    .stTextArea textarea,
+    .stSelectbox div,
+    .stMultiSelect div {
+        font-size: 16px !important;
+    }
+    </style>
+    """
+
+
+def install_app_shell_bridge():
+    """Install top-window listeners via a tiny iframe (markdown cannot run JS)."""
+    render_html_embed(_static_html("shell_bridge.html"), height=1)
 
 
 def render_live_field_map(
@@ -2328,9 +431,18 @@ def render_live_field_map(
     zoom=19,
     height=520,
 ):
-    # The nearest grid point is picked client-side and updated as you move.
+    # Active target is chosen client-side among the visible (non-visited) points.
+    grid_id = (
+        f"{float(st.session_state.get('preview_origin_lat', center_lat)):.7f},"
+        f"{float(st.session_state.get('preview_origin_lon', center_lon)):.7f},"
+        f"{current_grid_orientation_deg():.3f},"
+        f"{float(st.session_state.get('grid_spacing', 2.0)):.3f},"
+        f"{1 if st.session_state.get('grid_staggered', True) else 0},"
+        f"{1 if st.session_state.get('grid_endless', True) else 0}"
+    )
     config = {
         "grid_points": grid_points,
+        "grid_id": grid_id,
         "target_point": None,
         "target_lat": None,
         "target_lon": None,
@@ -2344,14 +456,41 @@ def render_live_field_map(
         "zoom": zoom,
     }
     html = (
-        _LIVE_FIELD_MAP_HTML.replace("__MAP_CONFIG_B64__", _encode_map_payload(config))
+        _static_html("live_field_map.html")
+        .replace("__MAP_CONFIG_B64__", _encode_map_payload(config))
         .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
     )
     render_html_embed(html, height=height)
 
 
 def render_live_nav_panel(height=460):
-    render_html_embed(_LIVE_NAV_PANEL_HTML, height=height)
+    status = get_latest_rtk_status()
+    label = status.get("rtk_label") or "Waiting for GPS…"
+    css = status.get("rtk_class") or "unknown"
+    sats = status.get("num_sats")
+    try:
+        sats_i = int(sats) if sats is not None else 0
+    except (TypeError, ValueError):
+        sats_i = 0
+    sats_note = f" · {sats_i} sats" if sats_i > 0 else ""
+    html = (
+        _static_html("live_nav_panel.html")
+        .replace("__RTK_BAR_CLASS__", css)
+        .replace("__RTK_BAR_LABEL__", f"{label}{sats_note}")
+    )
+    render_html_embed(html, height=height)
+    # Match the seeded bar so the next poll only posts when quality changes.
+    st.session_state.last_posted_rtk_status = (
+        status.get("gps_qual"),
+        status.get("rtk_label"),
+        status.get("num_sats"),
+    )
+
+
+def invalidate_live_nav_panel():
+    """Force the live nav iframe to remount and re-sync RTK status."""
+    st.session_state.live_nav_panel_mounted = False
+    st.session_state.pop("last_posted_rtk_status", None)
 
 
 def post_user_position_update(user_lat, user_lon, session_key):
@@ -2369,7 +508,7 @@ def post_user_position_update(user_lat, user_lon, session_key):
 
 
 def post_endless_grid_window_if_needed(user_lat, user_lon):
-    """Show only the closest infinite-lattice point in the live field view."""
+    """Refresh the live endless lattice when the nearest-4 set changes."""
     if not st.session_state.get("grid_finalized"):
         return
     if not st.session_state.get("grid_endless", True):
@@ -2996,15 +1135,10 @@ def init_placement_state(current_lat, current_lon):
         st.session_state.preview_origin_lat = current_lat
     if "preview_origin_lon" not in st.session_state:
         st.session_state.preview_origin_lon = current_lon
-    # First GPS reading used as the zero point for meter offsets.
-    if "grid_ref_lat" not in st.session_state:
-        st.session_state.grid_ref_lat = current_lat
-    if "grid_ref_lon" not in st.session_state:
-        st.session_state.grid_ref_lon = current_lon
-    if "origin_offset_north_m" not in st.session_state:
-        st.session_state.origin_offset_north_m = 0.0
-    if "origin_offset_east_m" not in st.session_state:
-        st.session_state.origin_offset_east_m = 0.0
+    # Freeze the red "you are here" marker during placement at the first fix.
+    if "placement_user_lat" not in st.session_state:
+        st.session_state.placement_user_lat = float(current_lat)
+        st.session_state.placement_user_lon = float(current_lon)
     if "map_zoom" not in st.session_state:
         st.session_state.map_zoom = 19
     if "preview_orientation_deg" not in st.session_state:
@@ -3015,65 +1149,83 @@ def init_placement_state(current_lat, current_lon):
         st.session_state.placement_view_seq = 0
 
 
-def _meters_north_east(from_lat, from_lon, to_lat, to_lon):
-    """Return (north_m, east_m) from one lat/lon to another."""
-    north_m = (float(to_lat) - float(from_lat)) * 111320.0
-    east_m = (
-        (float(to_lon) - float(from_lon))
-        * 111320.0
-        * math.cos(math.radians(float(from_lat)))
+ORIGIN_STEP_M = 5.0
+_METERS_PER_DEG_LAT = 111320.0
+
+
+def _lat_step_deg(step_m=ORIGIN_STEP_M):
+    """Degrees of latitude equal to step_m meters."""
+    return float(step_m) / _METERS_PER_DEG_LAT
+
+
+def _lon_step_deg(lat, step_m=ORIGIN_STEP_M):
+    """Degrees of longitude equal to step_m meters at the given latitude."""
+    cos_lat = math.cos(math.radians(float(lat)))
+    meters_per_deg_lon = _METERS_PER_DEG_LAT * max(abs(cos_lat), 1e-6)
+    return float(step_m) / meters_per_deg_lon
+
+
+def freeze_placement_user_position(lat, lon):
+    """Pin the placement-screen user marker (no live tracking until finalize)."""
+    st.session_state.placement_user_lat = float(lat)
+    st.session_state.placement_user_lon = float(lon)
+
+
+def placement_user_latlon():
+    """Frozen user position shown on the placement map."""
+    return (
+        float(st.session_state.placement_user_lat),
+        float(st.session_state.placement_user_lon),
     )
-    return north_m, east_m
 
 
-def _origin_latlon_from_offsets(ref_lat, ref_lon, north_m, east_m):
-    """Move from the reference fix by north/east meters to a lat/lon origin."""
-    lat, lon = offset_latlon(ref_lat, ref_lon, 0.0, float(north_m))
-    return offset_latlon(lat, lon, 90.0, float(east_m))
+def post_placement_view(*, lat=None, lon=None, bearing=None, zoom=None):
+    """Move the already-mounted placement map without a Streamlit remount."""
+    payload = {"action": "setView"}
+    if lat is not None:
+        payload["lat"] = float(lat)
+    if lon is not None:
+        payload["lon"] = float(lon)
+    if bearing is not None:
+        payload["bearing"] = float(bearing) % 360.0
+    if zoom is not None:
+        payload["zoom"] = int(zoom)
+    post_map_message(payload)
 
 
-def queue_origin_offset_inputs(north_m, east_m):
-    """Stage meter offsets for the sidebar widgets (safe after they mount)."""
-    st.session_state.pending_origin_offset_north_m = float(north_m)
-    st.session_state.pending_origin_offset_east_m = float(east_m)
+def queue_origin_latlon_inputs(lat, lon):
+    """Stage absolute origin coords for the sidebar widgets (safe after they mount)."""
+    st.session_state.pending_origin_lat = float(lat)
+    st.session_state.pending_origin_lon = float(lon)
 
 
-def apply_pending_origin_offset_inputs():
-    """Apply staged offsets to widget keys. Call only before number_input mounts."""
-    if "pending_origin_offset_north_m" in st.session_state:
-        st.session_state.origin_offset_north_input = float(
-            st.session_state.pop("pending_origin_offset_north_m")
+def apply_pending_origin_latlon_inputs():
+    """Apply staged lat/lon to widget keys. Call only before number_input mounts."""
+    if "pending_origin_lat" in st.session_state:
+        st.session_state.origin_lat_input = float(
+            st.session_state.pop("pending_origin_lat")
         )
-    if "pending_origin_offset_east_m" in st.session_state:
-        st.session_state.origin_offset_east_input = float(
-            st.session_state.pop("pending_origin_offset_east_m")
+    if "pending_origin_lon" in st.session_state:
+        st.session_state.origin_lon_input = float(
+            st.session_state.pop("pending_origin_lon")
         )
 
 
-def apply_origin_offsets(north_m, east_m, *, sync_inputs=True, snap_map=True):
-    """Set the grid origin from meter offsets relative to the first GPS fix."""
-    ref_lat = float(st.session_state.grid_ref_lat)
-    ref_lon = float(st.session_state.grid_ref_lon)
-    lat, lon = _origin_latlon_from_offsets(ref_lat, ref_lon, north_m, east_m)
-    st.session_state.preview_origin_lat = lat
-    st.session_state.preview_origin_lon = lon
-    st.session_state.origin_offset_north_m = float(north_m)
-    st.session_state.origin_offset_east_m = float(east_m)
+def apply_origin_latlon(lat, lon, *, sync_inputs=True, snap_map=True, remount_map=False):
+    """Set the grid origin to an absolute lat/lon."""
+    st.session_state.preview_origin_lat = float(lat)
+    st.session_state.preview_origin_lon = float(lon)
     if sync_inputs:
-        queue_origin_offset_inputs(north_m, east_m)
-    if snap_map:
+        queue_origin_latlon_inputs(lat, lon)
+    if remount_map:
         st.session_state.placement_view_seq += 1
-
-
-def sync_origin_offsets_from_latlon(origin_lat, origin_lon, *, sync_inputs=True):
-    """Update stored meter offsets to match an absolute origin lat/lon."""
-    ref_lat = float(st.session_state.grid_ref_lat)
-    ref_lon = float(st.session_state.grid_ref_lon)
-    north_m, east_m = _meters_north_east(ref_lat, ref_lon, origin_lat, origin_lon)
-    st.session_state.origin_offset_north_m = float(north_m)
-    st.session_state.origin_offset_east_m = float(east_m)
-    if sync_inputs:
-        queue_origin_offset_inputs(north_m, east_m)
+    elif snap_map and not st.session_state.get("grid_finalized"):
+        post_placement_view(
+            lat=lat,
+            lon=lon,
+            bearing=float(st.session_state.get("preview_orientation_deg", 0.0)),
+            zoom=st.session_state.get("map_zoom"),
+        )
 
 
 def _heading_delta_deg(a, b):
@@ -3095,24 +1247,34 @@ def apply_pending_grid_heading_input():
     )
 
 
-def apply_grid_heading_deg(orientation_deg, *, sync_input=True):
-    """Set grid heading and force the placement map to rotate screen-up to match."""
+def apply_grid_heading_deg(orientation_deg, *, sync_input=True, remount_map=False):
+    """Set grid heading and rotate the placement map screen-up to match."""
     orientation = float(orientation_deg) % 360.0
     st.session_state.preview_orientation_deg = orientation
     if sync_input:
         # Never write the widget key here — it may already be mounted (sidebar
         # apply path) or live in another fragment (map rotate). Stage instead.
         queue_grid_heading_input(orientation)
-    st.session_state.placement_view_seq += 1
+    if remount_map:
+        st.session_state.placement_view_seq += 1
+    elif not st.session_state.get("grid_finalized"):
+        post_placement_view(
+            lat=float(st.session_state.preview_origin_lat),
+            lon=float(st.session_state.preview_origin_lon),
+            bearing=orientation,
+            zoom=st.session_state.get("map_zoom"),
+        )
 
 
 def reset_grid_to_current_position(current_lat, current_lon, line_count_m, line_count_e, spacing):
-    st.session_state.grid_ref_lat = current_lat
-    st.session_state.grid_ref_lon = current_lon
-    apply_origin_offsets(0.0, 0.0, sync_inputs=True, snap_map=False)
-    st.session_state.preview_origin_lat = current_lat
-    st.session_state.preview_origin_lon = current_lon
-    apply_grid_heading_deg(0.0)
+    freeze_placement_user_position(current_lat, current_lon)
+    apply_origin_latlon(
+        current_lat, current_lon, sync_inputs=True, snap_map=False, remount_map=True
+    )
+    apply_grid_heading_deg(0.0, remount_map=False)
+    # Remount picks up heading 0 with the new view_seq origin snap.
+    st.session_state.preview_orientation_deg = 0.0
+    queue_grid_heading_input(0.0)
     st.session_state.pop("last_endless_window_key", None)
     if st.session_state.grid_finalized:
         st.session_state.grid_orientation_deg = 0.0
@@ -3160,6 +1322,19 @@ def grid_save_safe_name(name):
         safe_name = time.strftime("grid_%Y%m%d_%H%M%S")
     return safe_name
 
+@st.cache_data(ttl=5.0, show_spinner=False)
+def _list_saved_grid_names():
+    """Cached basenames only — Path objects are not reliably cacheable."""
+    if not GRID_SAVE_DIR.is_dir():
+        return ()
+    return tuple(sorted(p.name for p in GRID_SAVE_DIR.glob("*.json")))
+
+
+def list_saved_grids():
+    """Return saved grid paths (cached briefly — cleared on save)."""
+    return [GRID_SAVE_DIR / name for name in _list_saved_grid_names()]
+
+
 def save_grid_to_file(name):
     """Save origin, orientation, and grid parameters as JSON. Returns filename."""
     GRID_SAVE_DIR.mkdir(exist_ok=True)
@@ -3180,12 +1355,8 @@ def save_grid_to_file(name):
     }
     file_path = GRID_SAVE_DIR / f"{safe_name}.json"
     file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _list_saved_grid_names.clear()
     return file_path.name, orientation
-
-def list_saved_grids():
-    if not GRID_SAVE_DIR.is_dir():
-        return []
-    return sorted(GRID_SAVE_DIR.glob("*.json"))
 
 def saved_grid_exists(name):
     return (GRID_SAVE_DIR / f"{grid_save_safe_name(name)}.json").is_file()
@@ -3220,22 +1391,15 @@ def apply_pending_grid_load():
     st.session_state.grid_endless = endless
     st.session_state.preview_origin_lat = origin_lat
     st.session_state.preview_origin_lon = origin_lon
-    # Treat the loaded origin as the new zero point for meter offsets.
-    st.session_state.grid_ref_lat = origin_lat
-    st.session_state.grid_ref_lon = origin_lon
-    st.session_state.origin_offset_north_m = 0.0
-    st.session_state.origin_offset_east_m = 0.0
-    queue_origin_offset_inputs(0.0, 0.0)
+    queue_origin_latlon_inputs(origin_lat, origin_lon)
     st.session_state.preview_orientation_deg = orientation
     st.session_state.grid_orientation_deg = orientation
     queue_grid_heading_input(orientation)
     st.session_state.pop("last_endless_window_key", None)
-    # Open the placement view snapped to the loaded origin/orientation so the
-    # user can confirm (or tweak) before pressing "Finalize grid location".
-    st.session_state.grid_finalized = False
-    st.session_state.placement_view_seq += 1
+    # Skip placement — go straight to live field navigation.
+    finalize_grid_location(rows, cols, spacing)
     st.session_state.live_map_mounted = False
-    st.session_state.live_nav_panel_mounted = False
+    invalidate_live_nav_panel()
 
 def apply_pending_saved_grid_choice():
     """Select a newly saved grid in the sidebar before its selectbox mounts."""
@@ -3247,26 +1411,15 @@ def apply_pending_saved_grid_choice():
 st.set_page_config(page_title="RTK Live Map Guide", layout="wide")
 st.title("RTK Live Map Guide")
 
-# Streamlit fades elements to 33% opacity while a rerun is in flight
-# ("stale" elements). Every map pan triggers a rerun, so without this the
-# placement map grays out on each drag and feels broken.
-st.markdown(
-    """
-    <style>
-    [data-testid="stElementContainer"][data-stale="true"]:has(iframe.stCustomComponentV1) {
-        opacity: 1 !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown(_app_shell_css(), unsafe_allow_html=True)
+install_app_shell_bridge()
 
-msg = poll_gps(timeout_s=0.2)
+# Prefer a cached fix; only briefly drain the serial port. Avoid long blocking
+# waits so the first page paint stays responsive on the Pi.
+poll_gps(timeout_s=0.05 if st.session_state.get("grid_finalized") else 0.0)
 coords = latest_gps_fix()
 if coords is None:
-    # Brief blocking wait for the first fix, then yield back to Streamlit
-    # instead of spinning forever in this process (which froze the UI).
-    poll_gps(timeout_s=1.0)
+    poll_gps(timeout_s=0.25)
     coords = latest_gps_fix()
 if coords is None:
     if _gps_serial_error:
@@ -3275,8 +1428,16 @@ if coords is None:
         st.warning(
             f"Waiting for a valid GPS fix from the receiver on {_gps_serial_port}..."
         )
-    time.sleep(0.5)
-    st.rerun()
+
+    @st.fragment(run_every=0.5)
+    def _wait_for_first_fix():
+        poll_gps(timeout_s=0.2)
+        if latest_gps_fix() is not None:
+            st.rerun(scope="app")
+        st.caption("Listening for GGA…")
+
+    _wait_for_first_fix()
+    st.stop()
 
 current_lat, current_lon = coords
 init_placement_state(current_lat, current_lon)
@@ -3342,7 +1503,7 @@ with st.sidebar:
             if center is not None:
                 st.session_state.last_endless_window_key = center
             st.session_state.live_map_mounted = False
-            st.session_state.live_nav_panel_mounted = False
+            invalidate_live_nav_panel()
             st.rerun(scope="app")
 
     st.header("Grid Settings")
@@ -3359,7 +1520,7 @@ with st.sidebar:
             key="grid_endless",
             help=(
                 "Infinite lattice locked at finalize. The live field view displays "
-                "only the lattice point closest to your current position. "
+                "the four nearest lattice points. Visited points stay yellow. "
                 "Placement preview uses a fixed 4×4 neighborhood."
             ),
         )
@@ -3389,51 +1550,53 @@ with st.sidebar:
         )
 
         if not st.session_state.get("grid_finalized"):
-            apply_pending_origin_offset_inputs()
-            if "origin_offset_north_input" not in st.session_state:
-                st.session_state.origin_offset_north_input = float(
-                    st.session_state.get("origin_offset_north_m", 0.0)
-                )
-            if "origin_offset_east_input" not in st.session_state:
-                st.session_state.origin_offset_east_input = float(
-                    st.session_state.get("origin_offset_east_m", 0.0)
-                )
+            apply_pending_origin_latlon_inputs()
+            stored_lat = float(st.session_state.preview_origin_lat)
+            stored_lon = float(st.session_state.preview_origin_lon)
+            if "origin_lat_input" not in st.session_state:
+                st.session_state.origin_lat_input = stored_lat
+            if "origin_lon_input" not in st.session_state:
+                st.session_state.origin_lon_input = stored_lon
             st.caption(
-                "Origin offset from the first GPS fix (or last Reset), in meters."
+                "Grid origin as absolute latitude / longitude. "
+                f"The +/- buttons step by {ORIGIN_STEP_M:.0f} meters."
             )
-            north_m = st.number_input(
-                "North (+) / South (−) m",
-                step=5.0,
-                format="%.1f",
-                key="origin_offset_north_input",
+            lat_in = st.number_input(
+                "Origin latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                step=_lat_step_deg(),
+                format="%.7f",
+                key="origin_lat_input",
                 help=(
-                    "Move the grid origin north or south from your first GPS "
-                    "reading. Step is 5 meters."
+                    "Absolute latitude of the grid origin. "
+                    f"Each step moves about {ORIGIN_STEP_M:.0f} meters north/south."
                 ),
             )
-            east_m = st.number_input(
-                "East (+) / West (−) m",
-                step=5.0,
-                format="%.1f",
-                key="origin_offset_east_input",
+            lon_in = st.number_input(
+                "Origin longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                step=_lon_step_deg(lat_in),
+                format="%.7f",
+                key="origin_lon_input",
                 help=(
-                    "Move the grid origin east or west from your first GPS "
-                    "reading. Step is 5 meters."
+                    "Absolute longitude of the grid origin. "
+                    f"Each step moves about {ORIGIN_STEP_M:.0f} meters east/west "
+                    "at the current latitude."
                 ),
             )
-            stored_north = float(st.session_state.get("origin_offset_north_m", 0.0))
-            stored_east = float(st.session_state.get("origin_offset_east_m", 0.0))
             if (
-                abs(float(north_m) - stored_north) > 0.05
-                or abs(float(east_m) - stored_east) > 0.05
+                abs(float(lat_in) - stored_lat) > 1e-9
+                or abs(float(lon_in) - stored_lon) > 1e-9
             ):
-                apply_origin_offsets(
-                    float(north_m),
-                    float(east_m),
+                apply_origin_latlon(
+                    float(lat_in),
+                    float(lon_in),
                     sync_inputs=False,
                     snap_map=True,
+                    remount_map=False,
                 )
-                st.rerun(scope="app")
 
             external = float(st.session_state.get("preview_orientation_deg", 0.0)) % 360.0
             apply_pending_grid_heading_input()
@@ -3454,16 +1617,16 @@ with st.sidebar:
             )
             typed = float(heading) % 360.0
             if abs(_heading_delta_deg(external, typed)) > 0.05:
-                apply_grid_heading_deg(typed, sync_input=False)
-                st.rerun(scope="app")
+                # Live-rotate the mounted map; do not full-app remount.
+                apply_grid_heading_deg(typed, sync_input=False, remount_map=False)
         else:
             st.caption(
-                f"Locked origin offset: "
-                f"N {float(st.session_state.get('origin_offset_north_m', 0.0)):.1f} m, "
-                f"E {float(st.session_state.get('origin_offset_east_m', 0.0)):.1f} m "
+                f"Locked origin: "
+                f"{float(st.session_state.preview_origin_lat):.7f}°, "
+                f"{float(st.session_state.preview_origin_lon):.7f}° "
                 f"· heading {current_grid_orientation_deg():.1f}° · "
                 f"spacing {float(st.session_state.get('grid_spacing', 2.0)):.1f} m "
-                "(Adjust grid placement to change)."
+                "(Return to grid creation to change)."
             )
 
         if st.button("Reset grid to current position", use_container_width=True):
@@ -3478,7 +1641,7 @@ with st.sidebar:
                 float(spacing),
             )
             st.session_state.live_map_mounted = False
-            st.session_state.live_nav_panel_mounted = False
+            invalidate_live_nav_panel()
             st.rerun(scope="app")
 
         _sync_grid_config_from_session()
@@ -3487,8 +1650,13 @@ with st.sidebar:
 
     st.header("NTRIP")
 
-    @st.fragment(run_every=1.0)
+    # During placement, poll NTRIP status less often so sidebar buttons stay snappy.
+    _ntrip_refresh_s = 1.0 if st.session_state.get("grid_finalized") else 3.0
+
+    @st.fragment(run_every=_ntrip_refresh_s)
     def render_ntrip_controls():
+        # Keep the serial RX drained (and NTRIP GGA fed) without a busy placement loop.
+        poll_gps(timeout_s=0.0)
         status = get_ntrip_status()
         active = status.get("desired")
         active_key = status.get("desired_key")
@@ -3499,9 +1667,9 @@ with st.sidebar:
                 if (active or {}).get("source") == "local"
                 else "RTK2GO"
             )
-        if "ntrip_mountpoint_input" not in st.session_state:
+        if st.session_state.get("ntrip_mountpoint_input") is None:
             st.session_state.ntrip_mountpoint_input = (
-                (active or {}).get("mountpoint")
+                (active or {}).get("mountpoint") or NTRIP_DEFAULT_MOUNTPOINT
             )
         if "ntrip_local_host" not in st.session_state:
             st.session_state.ntrip_local_host = (
@@ -3574,8 +1742,8 @@ with st.sidebar:
             "Mountpoint",
             key="ntrip_mountpoint_input",
             help=mount_help,
-            value="CA_SanJose_ML_X5 ",
         )
+   
 
         try:
             requested_target = _normalize_ntrip_target(
@@ -3718,9 +1886,9 @@ with st.sidebar:
 if not st.session_state.grid_finalized:
     st.subheader("Position Your Grid")
     st.caption(
-        "Pan and zoom to place the origin, or set **North/East offsets** (5 m steps) "
-        "and a **Grid heading** in the sidebar to rotate the map so the grid stays "
-        "upright on screen. "
+        "Pan and zoom to place the origin, or set **latitude / longitude** "
+        f"(+/- steps ≈ {ORIGIN_STEP_M:.0f} m) and **Grid heading** in the sidebar. "
+        "Your position marker stays fixed at the first GPS reading until you finalize. "
         "The grid origin (green) stays at the map center. "
         "Click **Finalize grid location** to confirm."
     )
@@ -3729,13 +1897,14 @@ if not st.session_state.grid_finalized:
     # origin as a component value) reruns only this block, not the whole
     # script. That keeps reruns fast on the Pi and the UI steady.
     @st.fragment
-    def placement_map_fragment(user_lat, user_lon):
+    def placement_map_fragment():
         placement_endless = bool(st.session_state.get("grid_endless", True))
         if placement_endless:
             placement_rows, placement_cols = 4, 4
         else:
             placement_rows = int(st.session_state.get("grid_dim_m", 4))
             placement_cols = int(st.session_state.get("grid_dim_e", 4))
+        user_lat, user_lon = placement_user_latlon()
         map_state = render_placement_map(
             center_lat=st.session_state.preview_origin_lat,
             center_lon=st.session_state.preview_origin_lon,
@@ -3761,59 +1930,26 @@ if not st.session_state.grid_finalized:
             st.session_state.preview_origin_lat = float(map_state["lat"])
             st.session_state.preview_origin_lon = float(map_state["lon"])
             st.session_state.map_zoom = int(map_state["zoom"])
-            # Keep the meter-offset inputs aligned with a manual map pan.
-            sync_origin_offsets_from_latlon(
+            # Keep lat/lon inputs aligned with a manual map pan on the next
+            # sidebar interaction (avoid a full-app remount here).
+            queue_origin_latlon_inputs(
                 st.session_state.preview_origin_lat,
                 st.session_state.preview_origin_lon,
-                sync_inputs=True,
-            )
-            north_m = float(st.session_state.origin_offset_north_m)
-            east_m = float(st.session_state.origin_offset_east_m)
-            widget_north = st.session_state.get("origin_offset_north_input")
-            widget_east = st.session_state.get("origin_offset_east_input")
-            needs_offset_sync = (
-                widget_north is None
-                or widget_east is None
-                or abs(float(widget_north) - north_m) > 0.05
-                or abs(float(widget_east) - east_m) > 0.05
             )
 
-            needs_heading_sync = False
             if map_state.get("bearing") is not None:
                 bearing = float(map_state["bearing"]) % 360.0
                 st.session_state.preview_orientation_deg = bearing
                 widget_heading = st.session_state.get("grid_heading_input")
-                needs_heading_sync = widget_heading is None or (
+                if widget_heading is None or (
                     abs(_heading_delta_deg(float(widget_heading), bearing)) > 0.05
-                )
-                if needs_heading_sync:
+                ):
                     queue_grid_heading_input(bearing)
 
-            # Sidebar widgets live in another fragment — full app rerun is
-            # required so pending North/East (and heading) values are applied
-            # before those number_inputs remount.
-            if needs_offset_sync or needs_heading_sync:
-                st.rerun(scope="app")
-
-    placement_map_fragment(current_lat, current_lon)
-
-    @st.fragment(run_every=0.25)
-    def refresh_placement_user_marker():
-        poll_gps(timeout_s=0.1)
-        coords = latest_gps_fix()
-        if coords is None:
-            return
-        post_user_position_update(
-            coords[0],
-            coords[1],
-            "placement_user_pos",
-        )
-
-    refresh_placement_user_marker()
+    placement_map_fragment()
 
     col_info, col_finalize = st.columns([2, 1])
     with col_info:
-        orientation = current_grid_orientation_deg()
         st.markdown(
             "**Legend:** green = grid origin · blue = preview points · red = your position  \n"
         )
@@ -3826,7 +1962,7 @@ if not st.session_state.grid_finalized:
                     float(st.session_state.grid_spacing),
                 )
                 st.session_state.live_map_mounted = False
-                st.session_state.live_nav_panel_mounted = False
+                invalidate_live_nav_panel()
             st.rerun()
 
 else:
@@ -3839,6 +1975,13 @@ else:
     grid_points = grid_df_to_points(df)
 
     st.subheader("Live Navigation")
+
+    if not st.session_state.get("live_nav_panel_mounted"):
+        render_live_nav_panel(height=520)
+        st.session_state.live_nav_panel_mounted = True
+        # Remount can race the BroadcastChannel listener; force a follow-up
+        # push so the bar does not stick on the HTML default.
+        post_rtk_status_update(force=True)
 
     @st.fragment(run_every=0.25)
     def refresh_live_user_marker():
@@ -3856,23 +1999,23 @@ else:
 
     refresh_live_user_marker()
 
-    if not st.session_state.get("live_nav_panel_mounted"):
-        render_live_nav_panel(height=520)
-        st.session_state.live_nav_panel_mounted = True
-
     col_adjust, col_save = st.columns(2)
     with col_adjust:
-        if st.button("Adjust grid placement", use_container_width=True):
+        if st.button("Return to grid creation", use_container_width=True):
             st.session_state.grid_finalized = False
             # Keep the finalized orientation when returning to placement.
             if "grid_orientation_deg" in st.session_state:
                 st.session_state.preview_orientation_deg = float(
                     st.session_state.grid_orientation_deg
                 ) % 360.0
+            # Re-freeze the red marker at the current fix for the placement screen.
+            latest_coords = latest_gps_fix()
+            if latest_coords is not None:
+                freeze_placement_user_position(latest_coords[0], latest_coords[1])
             # Snap the placement map back to the finalized origin when it remounts.
             st.session_state.placement_view_seq += 1
             st.session_state.live_map_mounted = False
-            st.session_state.live_nav_panel_mounted = False
+            invalidate_live_nav_panel()
             st.rerun()
     with col_save:
         # Keep name entry / overwrite warnings in a fragment so typing a name
@@ -3911,12 +2054,11 @@ else:
                 # the sidebar "Saved grids" list both refresh; remount the live
                 # map because a full rerun would otherwise skip it.
                 st.session_state.grid_save_flash = (
-                    f"Grid saved to saved_grids/{saved_file} "
-                    f"({orientation:.1f}° from north)"
+                    f"Grid saved to saved_grids/{saved_file}."
                 )
                 st.session_state.pending_saved_grid_choice = Path(saved_file).stem
                 st.session_state.live_map_mounted = False
-                st.session_state.live_nav_panel_mounted = False
+                invalidate_live_nav_panel()
                 st.rerun(scope="app")
 
         render_grid_save_controls()

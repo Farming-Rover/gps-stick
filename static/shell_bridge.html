@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>gps-stick shell bridge</title>
+  </head>
+  <body>
+    <script>
+      (function () {
+        // Streamlit strips <script> from st.markdown, so this tiny iframe installs
+        // listeners on the top Streamlit window instead.
+        var topWin;
+        try {
+          topWin = window.top;
+        } catch (error) {
+          return;
+        }
+        if (!topWin) {
+          return;
+        }
+
+        var topDoc = topWin.document;
+        var FIT_VIEWPORT =
+          "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
+        var alreadyInstalled = !!topWin.__gpsStickShellInstalled;
+        topWin.__gpsStickShellInstalled = true;
+
+        // Remove any leftover Fit page control from earlier builds.
+        var staleFit = topDoc.getElementById("gps-stick-fit-page");
+        if (staleFit && staleFit.parentNode) {
+          staleFit.parentNode.removeChild(staleFit);
+        }
+
+        function ensureViewportMeta() {
+          var meta = topDoc.querySelector('meta[name="viewport"]');
+          if (!meta) {
+            meta = topDoc.createElement("meta");
+            meta.setAttribute("name", "viewport");
+            if (topDoc.head) {
+              topDoc.head.insertBefore(meta, topDoc.head.firstChild);
+            }
+          }
+          return meta;
+        }
+
+        function resetPageZoom() {
+          var meta = ensureViewportMeta();
+          // Safari sometimes ignores a no-op content write; toggle to force apply.
+          meta.setAttribute(
+            "content",
+            "width=device-width, initial-scale=1.0001, maximum-scale=1, user-scalable=no"
+          );
+          try {
+            topWin.scrollTo(0, 0);
+          } catch (error) {}
+          setTimeout(function () {
+            meta.setAttribute("content", FIT_VIEWPORT);
+            try {
+              topWin.scrollTo(0, 0);
+            } catch (error) {}
+          }, 30);
+        }
+
+        // Lock scale up front so focus-into-inputs cannot leave the page zoomed.
+        ensureViewportMeta().setAttribute("content", FIT_VIEWPORT);
+
+        if (alreadyInstalled) {
+          return;
+        }
+
+        function sidebarEl() {
+          return topDoc.querySelector('[data-testid="stSidebar"]');
+        }
+
+        function isSidebarExpanded() {
+          var sidebar = sidebarEl();
+          if (!sidebar) {
+            return false;
+          }
+          var aria = sidebar.getAttribute("aria-expanded");
+          if (aria === "false") {
+            return false;
+          }
+          if (aria === "true") {
+            return true;
+          }
+          var rect = sidebar.getBoundingClientRect();
+          return rect.width > 40 && rect.left > -rect.width * 0.5;
+        }
+
+        function collapseSidebar() {
+          if (!isSidebarExpanded()) {
+            return;
+          }
+          var collapseRoot = topDoc.querySelector(
+            '[data-testid="stSidebarCollapseButton"]'
+          );
+          var button =
+            (collapseRoot && collapseRoot.querySelector("button")) ||
+            collapseRoot;
+          if (button && typeof button.click === "function") {
+            button.click();
+          }
+        }
+
+        topDoc.addEventListener(
+          "mousedown",
+          function (event) {
+            var sidebar = sidebarEl();
+            if (!sidebar || !isSidebarExpanded()) {
+              return;
+            }
+            var target = event.target;
+            if (!target || !(target instanceof topWin.Node)) {
+              return;
+            }
+            if (sidebar.contains(target)) {
+              return;
+            }
+            var collapseRoot = topDoc.querySelector(
+              '[data-testid="stSidebarCollapseButton"]'
+            );
+            if (collapseRoot && collapseRoot.contains(target)) {
+              return;
+            }
+            var collapsedCtl = topDoc.querySelector(
+              '[data-testid="stSidebarCollapsedControl"]'
+            );
+            if (collapsedCtl && collapsedCtl.contains(target)) {
+              return;
+            }
+            if (
+              target.closest &&
+              target.closest('iframe[data-gps-stick-fs-active="1"]')
+            ) {
+              return;
+            }
+            var main =
+              topDoc.querySelector('[data-testid="stAppViewContainer"]') ||
+              topDoc.querySelector('[data-testid="stMain"]') ||
+              topDoc.querySelector("section.main");
+            if (main && main.contains(target)) {
+              collapseSidebar();
+            }
+          },
+          true
+        );
+
+        // After leaving a text field, snap back to the unzoomed page.
+        topDoc.addEventListener(
+          "focusout",
+          function (event) {
+            var target = event.target;
+            if (!target || !target.tagName) {
+              return;
+            }
+            var tag = String(target.tagName).toLowerCase();
+            if (
+              tag === "input" ||
+              tag === "textarea" ||
+              tag === "select" ||
+              (target.getAttribute &&
+                target.getAttribute("contenteditable") === "true")
+            ) {
+              setTimeout(resetPageZoom, 50);
+            }
+          },
+          true
+        );
+
+        function findFrameIn(doc, childWin) {
+          if (!doc) {
+            return null;
+          }
+          var frames = doc.querySelectorAll("iframe");
+          for (var i = 0; i < frames.length; i += 1) {
+            try {
+              if (frames[i].contentWindow === childWin) {
+                return frames[i];
+              }
+            } catch (error) {
+              // Cross-origin frame; skip.
+            }
+          }
+          return null;
+        }
+
+        function collectAncestorFrames(sourceWin) {
+          var chain = [];
+          var win = sourceWin;
+          while (win && win !== topWin) {
+            var parentWin = win.parent;
+            if (!parentWin) {
+              break;
+            }
+            var frame = null;
+            try {
+              frame = findFrameIn(parentWin.document, win);
+            } catch (error) {
+              frame = null;
+            }
+            if (frame) {
+              chain.push(frame);
+            }
+            win = parentWin;
+          }
+          return chain;
+        }
+
+        var FULLSCREEN_STYLE = [
+          "position:fixed",
+          "inset:0",
+          "width:100vw",
+          "height:100dvh",
+          "max-width:none",
+          "max-height:none",
+          "z-index:2147483646",
+          "border:none",
+          "background:#f4f6f8",
+          "margin:0",
+          "padding:0",
+          "display:block",
+        ].join(";");
+
+        function setFrameFullscreen(frame, active) {
+          if (!frame) {
+            return;
+          }
+          if (active) {
+            if (frame.dataset.gpsStickFs == null) {
+              frame.dataset.gpsStickFs = frame.getAttribute("style") || "";
+            }
+            frame.setAttribute("data-gps-stick-fs-active", "1");
+            frame.style.cssText = FULLSCREEN_STYLE;
+          } else if (frame.getAttribute("data-gps-stick-fs-active") === "1") {
+            frame.style.cssText = frame.dataset.gpsStickFs || "";
+            delete frame.dataset.gpsStickFs;
+            frame.removeAttribute("data-gps-stick-fs-active");
+          }
+        }
+
+        topWin.addEventListener("message", function (event) {
+          var data = event.data;
+          if (!data || data.type !== "gps-stick-nav-fullscreen") {
+            return;
+          }
+          var chain = collectAncestorFrames(event.source);
+          for (var i = 0; i < chain.length; i += 1) {
+            setFrameFullscreen(chain[i], !!data.active);
+          }
+        });
+
+        topWin.addEventListener("orientationchange", function () {
+          setTimeout(resetPageZoom, 100);
+        });
+      })();
+    </script>
+  </body>
+</html>

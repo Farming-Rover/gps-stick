@@ -1,0 +1,10 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+# Faster local/Pi loads; headless is typical when serving phones on the LAN.
+headless = true
+
+[runner]
+# Prefer fragment-friendly reruns when supported.
+fastReruns = true

@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        font-family: sans-serif;
+        background: #f4f6f8;
+        color: #111;
+        color-scheme: light;
+      }
+
+      html.is-fullscreen,
+      body.is-fullscreen {
+        height: 100%;
+        height: 100dvh;
+        overflow: hidden;
+      }
+
+      .panel {
+        box-sizing: border-box;
+        min-height: 100%;
+        height: 100%;
+        padding: 16px 16px 12px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        background: #f4f6f8;
+        color: #111;
+      }
+
+      .arrow-wrap {
+        flex: 1 1 auto;
+        width: 100%;
+        min-height: 220px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+      }
+
+      .arrow {
+        position: relative;
+        width: min(58vw, 220px);
+        height: min(72vw, 270px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transform-origin: 50% 55%;
+        transition: transform 0.12s linear;
+      }
+
+      .arrow-svg {
+        position: relative;
+        width: 78%;
+        height: 88%;
+        overflow: visible;
+        filter: drop-shadow(0 10px 18px rgba(13, 71, 161, 0.35));
+        transition: filter 0.2s ease, opacity 0.2s ease;
+      }
+
+      .arrow-svg .arrow-body {
+        fill: url(#arrowFill);
+        stroke: #0d47a1;
+        stroke-width: 5;
+        stroke-linejoin: round;
+        stroke-linecap: round;
+      }
+
+      .arrow-svg .arrow-sheen {
+        fill: url(#arrowSheen);
+        opacity: 0.55;
+        pointer-events: none;
+      }
+
+      .arrow.disabled .arrow-svg {
+        filter: none;
+        opacity: 0.55;
+      }
+
+      .arrow.disabled .arrow-svg .arrow-body {
+        fill: #9e9e9e;
+        stroke: #757575;
+      }
+
+      .arrow.disabled .arrow-svg .arrow-sheen {
+        display: none;
+      }
+
+      .arrow.reached {
+        display: none;
+      }
+
+      .reached-mark {
+        display: none;
+        width: min(44vw, 140px);
+        height: min(44vw, 140px);
+        border-radius: 50%;
+        background: radial-gradient(circle at 40% 35%, #66bb6a, #1b5e20);
+        color: #fff;
+        font-size: min(22vw, 72px);
+        font-weight: 700;
+        line-height: 1;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 12px 28px rgba(27, 94, 32, 0.35);
+      }
+
+      .reached-mark.visible {
+        display: flex;
+      }
+
+      .distance-block {
+        text-align: center;
+        width: 100%;
+      }
+
+      .distance-value {
+        font-size: 42px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #111;
+        line-height: 1.1;
+      }
+
+      .status {
+        margin-top: 4px;
+        font-size: 15px;
+        color: #555;
+        text-align: center;
+        min-height: 1.2em;
+      }
+
+      .status.success {
+        color: #1b5e20;
+        font-weight: 600;
+      }
+
+      .status.warn {
+        color: #e65100;
+      }
+
+      .tolerance-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #777;
+        margin-top: 2px;
+      }
+
+      .tolerance-row input {
+        width: 72px;
+        padding: 6px 8px;
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        border-radius: 6px;
+        font-size: 16px;
+        color: #444;
+        background: #fff;
+      }
+
+      .compass-row {
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .compass-btn {
+        border: none;
+        border-radius: 10px;
+        padding: 12px 18px;
+        font: 15px/1.2 sans-serif;
+        font-weight: 700;
+        color: #fff;
+        background: #1565c0;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(21, 101, 192, 0.28);
+      }
+
+      .compass-btn:hover {
+        background: #0d47a1;
+      }
+
+      .compass-btn.enabled {
+        background: #2e7d32;
+        box-shadow: none;
+        cursor: default;
+      }
+
+      .compass-btn:disabled {
+        opacity: 0.7;
+        cursor: default;
+      }
+
+      .desktop-warn {
+        display: none;
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font: 600 14px/1.35 sans-serif;
+        color: #e65100;
+        background: #fff3e0;
+        border: 1px solid rgba(230, 81, 0, 0.28);
+      }
+
+      .desktop-warn.visible {
+        display: block;
+      }
+
+      .fullscreen-btn {
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 10px;
+        padding: 12px 14px;
+        font: 14px/1.2 sans-serif;
+        font-weight: 600;
+        color: #1565c0;
+        background: #fff;
+        cursor: pointer;
+      }
+
+      .fullscreen-btn:hover {
+        background: #e3f2fd;
+      }
+
+      .rtk-bar {
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font: 600 15px/1.3 sans-serif;
+        letter-spacing: 0.01em;
+        border: 1px solid transparent;
+      }
+
+      .rtk-bar.unknown {
+        color: #555;
+        background: #eceff1;
+        border-color: rgba(0, 0, 0, 0.08);
+      }
+
+      .rtk-bar.none {
+        color: #b71c1c;
+        background: #ffebee;
+        border-color: rgba(183, 28, 28, 0.25);
+      }
+
+      .rtk-bar.float {
+        color: #e65100;
+        background: #fff3e0;
+        border-color: rgba(230, 81, 0, 0.28);
+      }
+
+      .rtk-bar.fix {
+        color: #1b5e20;
+        background: #e8f5e9;
+        border-color: rgba(27, 94, 32, 0.28);
+      }
+
+      .panel.is-fullscreen,
+      .panel:fullscreen,
+      .panel:-webkit-full-screen {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        height: 100dvh;
+        min-height: 100%;
+        min-height: 100dvh;
+        border-radius: 0;
+        z-index: 9999;
+        justify-content: center;
+        /* Force light surface: some phones paint a black fullscreen
+           backdrop while our distance text stays dark (#111). */
+        background: #f4f6f8 !important;
+        color: #111 !important;
+        color-scheme: light;
+        box-sizing: border-box;
+      }
+
+      .panel.is-fullscreen .rtk-bar,
+      .panel:fullscreen .rtk-bar,
+      .panel:-webkit-full-screen .rtk-bar {
+        font-size: 18px;
+        padding: 12px 14px;
+      }
+
+      .panel.is-fullscreen .arrow-wrap,
+      .panel:fullscreen .arrow-wrap,
+      .panel:-webkit-full-screen .arrow-wrap {
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      .panel.is-fullscreen .arrow,
+      .panel:fullscreen .arrow,
+      .panel:-webkit-full-screen .arrow {
+        width: min(90vw, 560px);
+        height: min(110vw, 680px);
+      }
+
+      .panel.is-fullscreen .reached-mark,
+      .panel:fullscreen .reached-mark,
+      .panel:-webkit-full-screen .reached-mark {
+        width: min(56vw, 220px);
+        height: min(56vw, 220px);
+        font-size: min(28vw, 96px);
+      }
+
+      .panel.is-fullscreen .distance-value,
+      .panel:fullscreen .distance-value,
+      .panel:-webkit-full-screen .distance-value {
+        color: #111 !important;
+        -webkit-text-fill-color: #111;
+        font-size: 64px;
+      }
+
+      .panel.is-fullscreen .distance-block,
+      .panel:fullscreen .distance-block,
+      .panel:-webkit-full-screen .distance-block {
+        color: #111;
+      }
+
+      .panel.is-fullscreen .status,
+      .panel:fullscreen .status,
+      .panel:-webkit-full-screen .status {
+        color: #444 !important;
+      }
+
+      .panel.is-fullscreen .tolerance-row,
+      .panel:fullscreen .tolerance-row,
+      .panel:-webkit-full-screen .tolerance-row {
+        color: #555 !important;
+      }
+
+      .panel.is-fullscreen .tolerance-row input,
+      .panel:fullscreen .tolerance-row input,
+      .panel:-webkit-full-screen .tolerance-row input {
+        color: #222 !important;
+        background: #fff !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel" id="nav-panel">
+      <div class="compass-row">
+        <button id="enable-compass" class="compass-btn" type="button">
+          Enable compass
+        </button>
+        <button
+          id="fullscreen-btn"
+          class="fullscreen-btn"
+          type="button"
+          title="Expand the navigation arrow"
+        >
+          Fullscreen
+        </button>
+      </div>
+      <div id="desktop-warn" class="desktop-warn" role="status" aria-live="polite">
+        Open this page on a phone or tablet to get compass heading. Distance still works on desktop.
+      </div>
+      <div id="rtk-bar" class="rtk-bar __RTK_BAR_CLASS__" role="status" aria-live="polite">
+        __RTK_BAR_LABEL__
+      </div>
+      <div class="arrow-wrap" title="Direction to target relative to the way you are facing">
+        <div id="nav-arrow" class="arrow disabled">
+          <svg
+            class="arrow-svg"
+            viewBox="0 0 200 280"
+            xmlns="http://www.w3.org/2000/svg"
+            aria-hidden="true"
+          >
+            <defs>
+              <linearGradient id="arrowFill" x1="100" y1="16" x2="100" y2="268" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#42a5f5" />
+                <stop offset="45%" stop-color="#1e88e5" />
+                <stop offset="100%" stop-color="#0d47a1" />
+              </linearGradient>
+              <linearGradient id="arrowSheen" x1="70" y1="40" x2="130" y2="220" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#ffffff" stop-opacity="0.55" />
+                <stop offset="55%" stop-color="#ffffff" stop-opacity="0.08" />
+                <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+              </linearGradient>
+            </defs>
+            <!-- Classic navigation arrow: tip, wings, tapered shaft -->
+            <path
+              class="arrow-body"
+              d="M100 18
+                 L178 118
+                 L142 118
+                 L142 250
+                 Q142 266 126 266
+                 L74 266
+                 Q58 266 58 250
+                 L58 118
+                 L22 118
+                 Z"
+            />
+            <path
+              class="arrow-sheen"
+              d="M100 34
+                 L150 108
+                 L128 108
+                 L128 240
+                 L100 240
+                 Z"
+            />
+          </svg>
+        </div>
+        <div id="reached-mark" class="reached-mark">✓</div>
+      </div>
+      <div class="distance-block">
+        <div id="distance-value" class="distance-value">--</div>
+        <div id="status-line" class="status">Tap Enable compass above, then follow the arrow. Position comes from the RTK receiver.</div>
+      </div>
+      <div class="tolerance-row">
+        <label for="tolerance-cm">Reach tolerance</label>
+        <input
+          id="tolerance-cm"
+          type="number"
+          min="0.5"
+          step="0.5"
+          value="10"
+        />
+        <span>cm</span>
+      </div>
+    </div>
+    <script>
+      const NAV_MESSAGE_TYPE = "gps-stick-nav";
+      const NAV_CONFIG_MESSAGE_TYPE = "gps-stick-nav-config";
+      const HEADING_MESSAGE_TYPE = "gps-stick-heading";
+
+      // Cumulative CSS angle so 359°→0° takes the short path instead of
+      // spinning ~359° the long way around (0 and 360 are the same heading).
+      let arrowRotCum = null;
+      let compassEnabled = false;
+      let hasAbsoluteHeading = false;
+      let headingSin = null;
+      let headingCos = null;
+      let headingFilterReady = false;
+      let headingPublishTimer = null;
+      let orientationEventSeen = false;
+      // Sticky across BroadcastChannel updates so desktop/insecure warnings
+      // are not wiped by distance-only payloads from the field map.
+      let panelSensorIssue = null;
+      const HEADING_SMOOTHING = 0.35;
+      const HEADING_PUBLISH_MS = 100;
+
+      function setArrowRotation(degrees) {
+        const arrow = document.getElementById("nav-arrow");
+        if (!arrow) {
+          return;
+        }
+        if (!Number.isFinite(degrees)) {
+          arrowRotCum = null;
+          arrow.style.transform = "rotate(0deg)";
+          return;
+        }
+        const target = ((Number(degrees) % 360) + 360) % 360;
+        if (arrowRotCum == null) {
+          arrowRotCum = target;
+        } else {
+          const currentMod = ((arrowRotCum % 360) + 360) % 360;
+          arrowRotCum += ((target - currentMod + 540) % 360) - 180;
+        }
+        arrow.style.transform = `rotate(${arrowRotCum}deg)`;
+      }
+
+      function formatDistance(meters) {
+        if (meters == null || !Number.isFinite(Number(meters))) {
+          return "--";
+        }
+        return `${Number(meters).toFixed(2)} m`;
+      }
+
+      function publishTolerance() {
+        const input = document.getElementById("tolerance-cm");
+        const cm = Number(input && input.value);
+        if (!Number.isFinite(cm) || cm <= 0) {
+          return;
+        }
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(NAV_CONFIG_MESSAGE_TYPE);
+            channel.postMessage({ tolerance_m: cm / 100 });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function publishHeading(heading) {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+            channel.postMessage({ heading: Number(heading) });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function requestMapEnableCompass() {
+        try {
+          if (typeof BroadcastChannel !== "undefined") {
+            const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);
+            channel.postMessage({ action: "enableCompass" });
+            channel.close();
+          }
+        } catch (error) {
+          // Ignore channel errors on older browsers.
+        }
+      }
+
+      function extractHeading(event) {
+        if (
+          event.webkitCompassHeading != null &&
+          Number.isFinite(event.webkitCompassHeading)
+        ) {
+          return { heading: event.webkitCompassHeading, absolute: true };
+        }
+        if (event.alpha != null && Number.isFinite(event.alpha)) {
+          const absolute =
+            event.absolute === true || event.type === "deviceorientationabsolute";
+          return { heading: (360 - event.alpha) % 360, absolute };
+        }
+        return null;
+      }
+
+      function getSmoothedHeading() {
+        if (!headingFilterReady) {
+          return null;
+        }
+        return (
+          ((Math.atan2(headingSin, headingCos) * 180) / Math.PI + 360) % 360
+        );
+      }
+
+      function onDeviceOrientation(event) {
+        orientationEventSeen = true;
+        const reading = extractHeading(event);
+        if (reading == null) {
+          return;
+        }
+        if (reading.absolute) {
+          hasAbsoluteHeading = true;
+        } else if (hasAbsoluteHeading) {
+          return;
+        }
+        const rad = (reading.heading * Math.PI) / 180;
+        if (headingSin == null) {
+          headingSin = Math.sin(rad);
+          headingCos = Math.cos(rad);
+        } else {
+          headingSin += HEADING_SMOOTHING * (Math.sin(rad) - headingSin);
+          headingCos += HEADING_SMOOTHING * (Math.cos(rad) - headingCos);
+        }
+        headingFilterReady = true;
+      }
+
+      function startHeadingPublish() {
+        if (headingPublishTimer != null) {
+          return;
+        }
+        headingPublishTimer = setInterval(() => {
+          const heading = getSmoothedHeading();
+          if (heading == null) {
+            return;
+          }
+          publishHeading(heading);
+        }, HEADING_PUBLISH_MS);
+      }
+
+      async function requestOrientationPermission() {
+        if (
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+        ) {
+          const response = await DeviceOrientationEvent.requestPermission();
+          return response === "granted";
+        }
+        return true;
+      }
+
+      async function enableCompass() {
+        const button = document.getElementById("enable-compass");
+        const statusLine = document.getElementById("status-line");
+        try {
+          const granted = await requestOrientationPermission();
+          if (!granted) {
+            if (statusLine) {
+              statusLine.textContent =
+                "Compass permission denied. Distance still works without facing direction.";
+              statusLine.className = "status warn";
+            }
+            return;
+          }
+        } catch (error) {
+          // Continue; some browsers fire orientation without an explicit grant.
+        }
+
+        if ("ondeviceorientationabsolute" in window) {
+          window.addEventListener(
+            "deviceorientationabsolute",
+            onDeviceOrientation,
+            true
+          );
+        }
+        window.addEventListener("deviceorientation", onDeviceOrientation, true);
+        startHeadingPublish();
+        // Also ask the map iframe to enable its own sensors (cone / follow).
+        requestMapEnableCompass();
+
+        compassEnabled = true;
+        if (button) {
+          button.textContent = "Compass enabled";
+          button.classList.add("enabled");
+          button.disabled = true;
+        }
+        if (statusLine && statusLine.className.indexOf("success") < 0) {
+          statusLine.textContent =
+            "Compass enabled. Follow the arrow toward the nearest grid point.";
+          statusLine.className = "status";
+        }
+
+        setTimeout(() => {
+          if (!orientationEventSeen && statusLine) {
+            statusLine.textContent =
+              "No compass data is coming from this device. Distance still works.";
+            statusLine.className = "status warn";
+          }
+        }, 4000);
+      }
+
+      function updateRtkBar(payload) {
+        const bar = document.getElementById("rtk-bar");
+        if (!bar) {
+          return;
+        }
+        if (payload.rtk_label == null && payload.gps_qual == null) {
+          return;
+        }
+        let label = payload.rtk_label;
+        let cssClass = payload.rtk_class || "unknown";
+        if (!label) {
+          const qual = Number(payload.gps_qual);
+          if (qual === 4) {
+            label = "RTK Fix";
+            cssClass = "fix";
+          } else if (qual === 5) {
+            label = "RTK Float";
+            cssClass = "float";
+          } else if (Number.isFinite(qual)) {
+            label = "No RTK";
+            cssClass = "none";
+          } else {
+            label = "Waiting for GPS…";
+            cssClass = "unknown";
+          }
+        }
+        const sats = Number(payload.num_sats);
+        const satsNote =
+          Number.isFinite(sats) && sats > 0 ? ` · ${sats} sats` : "";
+        bar.textContent = `${label}${satsNote}`;
+        bar.className = `rtk-bar ${cssClass}`;
+      }
+
+      function updatePanel(payload) {
+        updateRtkBar(payload);
+
+        if (payload.sensorIssue) {
+          panelSensorIssue = payload.sensorIssue;
+        }
+        const activeSensorIssue = payload.sensorIssue || panelSensorIssue;
+
+        // Quality-only updates from Python skip the distance/arrow path.
+        if (
+          payload.distance === undefined &&
+          payload.relative_bearing === undefined &&
+          payload.reached === undefined &&
+          payload.sensorIssue === undefined &&
+          (payload.rtk_label != null || payload.gps_qual != null)
+        ) {
+          return;
+        }
+
+        const distanceValue = document.getElementById("distance-value");
+        const statusLine = document.getElementById("status-line");
+        const arrow = document.getElementById("nav-arrow");
+        const reachedMark = document.getElementById("reached-mark");
+        const targetSuffix = payload.target ? ` to ${payload.target}` : "";
+        const toleranceM = Number(payload.tolerance_m);
+        const tolCm = Number.isFinite(toleranceM)
+          ? (toleranceM * 100).toFixed(toleranceM * 100 < 10 ? 1 : 0)
+          : "1.5";
+        const hasDistance =
+          payload.distance != null && Number.isFinite(Number(payload.distance));
+
+        distanceValue.textContent = formatDistance(payload.distance);
+
+        if (payload.reached) {
+          arrow.classList.add("reached", "disabled");
+          reachedMark.classList.add("visible");
+          statusLine.textContent = `${payload.target || "TARGET"} REACHED (within ${tolCm} cm)!`;
+          statusLine.className = "status success";
+          return;
+        }
+
+        reachedMark.classList.remove("visible");
+        arrow.classList.remove("reached");
+
+        const bearing = Number(payload.relative_bearing);
+        if (Number.isFinite(bearing)) {
+          arrow.classList.remove("disabled");
+          setArrowRotation(bearing);
+          statusLine.textContent = `Target${targetSuffix}`;
+          statusLine.className = "status";
+        } else if (activeSensorIssue === "insecure") {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent = hasDistance
+            ? `${formatDistance(payload.distance)} to target · open over HTTPS for heading`
+            : "The browser blocks the compass over plain HTTP. Distance still works; open the app via HTTPS for the heading arrow.";
+          statusLine.className = "status warn";
+        } else if (activeSensorIssue === "desktop") {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent = hasDistance
+            ? `${formatDistance(payload.distance)}${targetSuffix} · use a phone or tablet for heading`
+            : "Desktop detected: use a phone or tablet for compass heading. Distance still works here.";
+          statusLine.className = "status warn";
+        } else if (activeSensorIssue === "no-compass") {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent =
+            "This device is not reporting compass data. Distance still works, but the heading arrow is unavailable.";
+          statusLine.className = "status warn";
+        } else if (payload.distance == null) {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent =
+            "Waiting for RTK position and an active grid target.";
+          statusLine.className = "status warn";
+        } else if (!compassEnabled) {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent =
+            "Tap Enable compass above for facing direction.";
+          statusLine.className = "status warn";
+        } else {
+          arrow.classList.add("disabled");
+          setArrowRotation(null);
+          statusLine.textContent =
+            "Waiting for compass heading from this device.";
+          statusLine.className = "status warn";
+        }
+
+        if (payload.accuracy != null && Number(payload.accuracy) > 5) {
+          statusLine.textContent += " GPS accuracy is low.";
+          statusLine.className = "status warn";
+        }
+      }
+
+      const toleranceInput = document.getElementById("tolerance-cm");
+      toleranceInput.addEventListener("change", publishTolerance);
+      toleranceInput.addEventListener("input", publishTolerance);
+      publishTolerance();
+
+      function isNativeFullscreen() {
+        return !!(
+          document.fullscreenElement ||
+          document.webkitFullscreenElement ||
+          document.msFullscreenElement
+        );
+      }
+
+      // iPhone/iPad (and iPadOS desktop-UA) do not support Fullscreen API for
+      // arbitrary elements inside iframes. Expand the parent iframe instead.
+      function needsParentPseudoFullscreen() {
+        const ua = navigator.userAgent || "";
+        const iOS = /iPad|iPhone|iPod/.test(ua);
+        const iPadOS =
+          navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1;
+        if (iOS || iPadOS) {
+          return true;
+        }
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return true;
+        }
+        return !(
+          panel.requestFullscreen ||
+          panel.webkitRequestFullscreen ||
+          panel.msRequestFullscreen
+        );
+      }
+
+      let parentPseudoFullscreen = false;
+
+      function setParentPseudoFullscreen(active) {
+        parentPseudoFullscreen = !!active;
+        const payload = {
+          type: "gps-stick-nav-fullscreen",
+          active: parentPseudoFullscreen,
+        };
+        function send() {
+          try {
+            // Prefer top: Streamlit may wrap st.iframe in an intermediate frame.
+            const target = window.top || window.parent;
+            target.postMessage(payload, "*");
+          } catch (error) {
+            try {
+              window.parent.postMessage(payload, "*");
+            } catch (innerError) {
+              // Parent may be unreachable in restricted embeds.
+            }
+          }
+        }
+        send();
+        // Retries: the shell bridge iframe may mount a moment later.
+        setTimeout(send, 30);
+        setTimeout(send, 120);
+        setTimeout(send, 300);
+      }
+
+      function updateFullscreenButton() {
+        const button = document.getElementById("fullscreen-btn");
+        const panel = document.getElementById("nav-panel");
+        if (!button || !panel) {
+          return;
+        }
+        const active =
+          isNativeFullscreen() ||
+          parentPseudoFullscreen ||
+          panel.classList.contains("is-fullscreen");
+        button.textContent = active ? "Exit fullscreen" : "Fullscreen";
+      }
+
+      function setLocalFullscreenClass(active) {
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return;
+        }
+        document.documentElement.classList.toggle("is-fullscreen", !!active);
+        document.body.classList.toggle("is-fullscreen", !!active);
+        panel.classList.toggle("is-fullscreen", !!active);
+      }
+
+      async function toggleFullscreen() {
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return;
+        }
+
+        const active =
+          isNativeFullscreen() ||
+          parentPseudoFullscreen ||
+          panel.classList.contains("is-fullscreen");
+
+        // Always expand the Streamlit iframe(s) to cover the page. Native
+        // Fullscreen alone only enlarges content inside a short iframe, which
+        // looks like "bigger arrow" instead of true full-screen.
+        if (active) {
+          try {
+            if (isNativeFullscreen()) {
+              const exit =
+                document.exitFullscreen ||
+                document.webkitExitFullscreen ||
+                document.msExitFullscreen;
+              if (exit) {
+                await exit.call(document);
+              }
+            }
+          } catch (error) {
+            // Ignore API failures; parent/CSS fallback still exits below.
+          }
+          setLocalFullscreenClass(false);
+          setParentPseudoFullscreen(false);
+        } else {
+          setParentPseudoFullscreen(true);
+          setLocalFullscreenClass(true);
+          // Extra immersive mode on browsers that support it.
+          if (!needsParentPseudoFullscreen()) {
+            try {
+              const request =
+                panel.requestFullscreen ||
+                panel.webkitRequestFullscreen ||
+                panel.msRequestFullscreen;
+              if (request) {
+                await request.call(panel);
+              }
+            } catch (error) {
+              // Parent iframe expand already covers the Streamlit UI.
+            }
+          }
+        }
+        updateFullscreenButton();
+      }
+
+      function onFullscreenChange() {
+        const panel = document.getElementById("nav-panel");
+        if (!panel) {
+          return;
+        }
+        if (isNativeFullscreen()) {
+          setLocalFullscreenClass(true);
+        } else if (!parentPseudoFullscreen) {
+          setLocalFullscreenClass(false);
+        }
+        updateFullscreenButton();
+      }
+
+      document
+        .getElementById("fullscreen-btn")
+        .addEventListener("click", toggleFullscreen);
+      document.addEventListener("fullscreenchange", onFullscreenChange);
+      document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          const navChannel = new BroadcastChannel(NAV_MESSAGE_TYPE);
+          navChannel.onmessage = (event) => {
+            updatePanel(event.data || {});
+          };
+        }
+      } catch (error) {
+        // Ignore channel errors on older browsers.
+      }
+
+      (function initCompassUi() {
+        const button = document.getElementById("enable-compass");
+        const desktopWarn = document.getElementById("desktop-warn");
+        const ua = navigator.userAgent || "";
+        const mobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(ua);
+        const hasTouch = (navigator.maxTouchPoints || 0) > 0;
+        const desktop = !mobile && !hasTouch;
+
+        if (!window.isSecureContext) {
+          if (button) {
+            button.style.display = "none";
+          }
+          updatePanel({ sensorIssue: "insecure" });
+          return;
+        }
+        if (desktop) {
+          // No device compass on desktop — hide the control, keep a clear warning.
+          if (button) {
+            button.style.display = "none";
+          }
+          if (desktopWarn) {
+            desktopWarn.classList.add("visible");
+          }
+          updatePanel({ sensorIssue: "desktop" });
+          return;
+        }
+        if (desktopWarn) {
+          desktopWarn.classList.remove("visible");
+        }
+        if (button) {
+          button.addEventListener("click", enableCompass);
+        }
+      })();
+    </script>
+  </body>
+</html>
