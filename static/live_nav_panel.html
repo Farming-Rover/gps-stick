@@ -47,6 +47,53 @@
         position: relative;
       }
 
+      .leveler {
+        position: relative;
+        flex: 0 0 auto;
+        width: 100%;
+        height: 72px;
+        margin-top: 2px;
+        overflow: hidden;
+        pointer-events: none;
+        color: #263238;
+      }
+
+      .level-line {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: min(58vw, 220px);
+        height: 0;
+        margin-left: calc(min(58vw, 220px) / -2);
+        border-top: 3px solid;
+        border-radius: 999px;
+        transform-origin: 50% 50%;
+        transition:
+          transform 0.1s linear,
+          border-color 0.15s ease,
+          opacity 0.15s ease;
+      }
+
+      .level-line.reference {
+        width: min(26vw, 92px);
+        margin-left: calc(min(26vw, 92px) / -2);
+        border-color: rgba(38, 50, 56, 0.5);
+      }
+
+      .level-line.horizon {
+        border-color: #ff9800;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+      }
+
+      .leveler.level .level-line {
+        border-color: #2e7d32;
+      }
+
+      .leveler.level .level-line.horizon {
+        border-width: 4px;
+        box-shadow: 0 0 8px rgba(46, 125, 50, 0.4);
+      }
+
       .arrow {
         position: relative;
         width: min(58vw, 220px);
@@ -304,6 +351,27 @@
         min-height: 0;
       }
 
+      .panel.is-fullscreen .leveler,
+      .panel:fullscreen .leveler,
+      .panel:-webkit-full-screen .leveler {
+        height: 96px;
+      }
+
+      .panel.is-fullscreen .level-line,
+      .panel:fullscreen .level-line,
+      .panel:-webkit-full-screen .level-line {
+        width: min(68vw, 520px);
+        margin-left: calc(min(68vw, 520px) / -2);
+      }
+
+      .panel.is-fullscreen .level-line.reference,
+      .panel:fullscreen .level-line.reference,
+      .panel:-webkit-full-screen .level-line.reference {
+        width: min(30vw, 180px);
+        margin-left: calc(min(30vw, 180px) / -2);
+        border-color: var(--fs-reference, rgba(17, 17, 17, 0.5));
+      }
+
       .panel.is-fullscreen .arrow,
       .panel:fullscreen .arrow,
       .panel:-webkit-full-screen .arrow {
@@ -421,6 +489,16 @@
         </div>
         <div id="reached-mark" class="reached-mark">✓</div>
       </div>
+      <div
+        id="leveler"
+        class="leveler"
+        role="status"
+        aria-live="polite"
+        aria-label="Level unavailable until compass is enabled"
+      >
+        <div class="level-line reference"></div>
+        <div id="level-horizon" class="level-line horizon"></div>
+      </div>
       <div class="distance-block">
         <div id="distance-value" class="distance-value">--</div>
         <div id="status-line" class="status">Tap Enable compass above, then follow the arrow. Position comes from the RTK receiver.</div>
@@ -452,11 +530,15 @@
       let headingFilterReady = false;
       let headingPublishTimer = null;
       let orientationEventSeen = false;
+      let smoothedPitch = null;
+      let smoothedRoll = null;
       // Sticky across BroadcastChannel updates so desktop/insecure warnings
       // are not wiped by distance-only payloads from the field map.
       let panelSensorIssue = null;
       const HEADING_SMOOTHING = 0.35;
       const HEADING_PUBLISH_MS = 100;
+      const LEVEL_SMOOTHING = 0.22;
+      const LEVEL_TOLERANCE_DEG = 2;
 
       function setArrowRotation(degrees) {
         const arrow = document.getElementById("nav-arrow");
@@ -550,8 +632,101 @@
         );
       }
 
+      function getScreenAngle() {
+        const screenAngle =
+          screen.orientation && Number(screen.orientation.angle);
+        if (Number.isFinite(screenAngle)) {
+          return ((screenAngle % 360) + 360) % 360;
+        }
+        const legacyAngle = Number(window.orientation);
+        return Number.isFinite(legacyAngle)
+          ? ((legacyAngle % 360) + 360) % 360
+          : 0;
+      }
+
+      function screenAdjustedPitchRoll(event) {
+        const beta = Number(event.beta);
+        const gamma = Number(event.gamma);
+        if (!Number.isFinite(beta) || !Number.isFinite(gamma)) {
+          return null;
+        }
+
+        // Resolve gravity into the phone's natural portrait screen axes.
+        // This produces camera-style angles: pitch is 0° when the camera
+        // points at the horizon, rather than when the phone lies flat.
+        const betaRad = (beta * Math.PI) / 180;
+        const gammaRad = (gamma * Math.PI) / 180;
+        let gravityX = -Math.sin(gammaRad) * Math.cos(betaRad);
+        let gravityY = Math.sin(betaRad);
+        const gravityZ = Math.cos(gammaRad) * Math.cos(betaRad);
+
+        // Rotate gravity into the current CSS screen axes in landscape.
+        const angle = getScreenAngle();
+        if (angle === 90) {
+          const x = gravityY;
+          gravityY = -gravityX;
+          gravityX = x;
+        } else if (angle === 180) {
+          gravityX = -gravityX;
+          gravityY = -gravityY;
+        } else if (angle === 270) {
+          const x = -gravityY;
+          gravityY = gravityX;
+          gravityX = x;
+        }
+
+        const pitch =
+          (Math.atan2(-gravityZ, Math.hypot(gravityX, gravityY)) * 180) /
+          Math.PI;
+        const roll =
+          (Math.atan2(gravityX, gravityY) * 180) / Math.PI;
+        return { pitch, roll };
+      }
+
+      function updateLeveler(event) {
+        const reading = screenAdjustedPitchRoll(event);
+        if (!reading) {
+          return;
+        }
+        if (smoothedPitch == null || smoothedRoll == null) {
+          smoothedPitch = reading.pitch;
+          smoothedRoll = reading.roll;
+        } else {
+          smoothedPitch +=
+            LEVEL_SMOOTHING * (reading.pitch - smoothedPitch);
+          const rollDelta =
+            ((reading.roll - smoothedRoll + 540) % 360) - 180;
+          smoothedRoll += LEVEL_SMOOTHING * rollDelta;
+        }
+
+        const leveler = document.getElementById("leveler");
+        const horizon = document.getElementById("level-horizon");
+        if (!leveler || !horizon) {
+          return;
+        }
+
+        const pitch = Math.max(-90, Math.min(90, smoothedPitch));
+        const roll = ((smoothedRoll + 540) % 360) - 180;
+        const maxOffset = Math.max(18, (leveler.clientHeight || 72) * 0.36);
+        const offset = (Math.max(-45, Math.min(45, pitch)) / 45) * maxOffset;
+        // The live line moves with pitch and counter-rotates with roll, so it
+        // stays visually parallel to the ground like a camera horizon guide.
+        horizon.style.transform =
+          `translateY(${offset.toFixed(1)}px) rotate(${-roll.toFixed(2)}deg)`;
+
+        const isLevel =
+          Math.abs(pitch) <= LEVEL_TOLERANCE_DEG &&
+          Math.abs(roll) <= LEVEL_TOLERANCE_DEG;
+        leveler.classList.toggle("level", isLevel);
+        leveler.setAttribute(
+          "aria-label",
+          isLevel ? "Level." : "Not level."
+        );
+      }
+
       function onDeviceOrientation(event) {
         orientationEventSeen = true;
+        updateLeveler(event);
         const reading = extractHeading(event);
         if (reading == null) {
           return;
@@ -819,6 +994,7 @@
         root.style.removeProperty("--fs-input-fg");
         root.style.removeProperty("--fs-input-bg");
         root.style.removeProperty("--fs-scheme");
+        root.style.removeProperty("--fs-reference");
       }
 
       function applyFullscreenTheme(payload) {
@@ -834,6 +1010,10 @@
         root.style.setProperty("--fs-input-fg", dark ? "#fafafa" : "#222");
         root.style.setProperty("--fs-input-bg", dark ? "#262730" : "#fff");
         root.style.setProperty("--fs-scheme", dark ? "dark" : "light");
+        root.style.setProperty(
+          "--fs-reference",
+          dark ? "rgba(250, 250, 250, 0.55)" : "rgba(17, 17, 17, 0.5)"
+        );
       }
 
       window.addEventListener("message", function (event) {
