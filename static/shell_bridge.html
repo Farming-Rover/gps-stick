@@ -23,9 +23,61 @@
         var FIT_VIEWPORT =
           "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
         // Bump when one-time shell listeners change.
-        var SHELL_VERSION = 3;
+        var SHELL_VERSION = 7;
         var alreadyInstalled = topWin.__gpsStickShellInstalled === SHELL_VERSION;
         topWin.__gpsStickShellInstalled = SHELL_VERSION;
+
+        // Streamlit defaults to Auto/system when light+dark themes exist.
+        // Seed "Light" when unset or System so the app opens white by default.
+        // Respect an explicit user choice of Dark (or Light).
+        (function ensureLightThemeDefault() {
+          var migrateKey = "gpsStickLightThemeDefaultV2";
+          try {
+            if (topWin.localStorage.getItem(migrateKey) === "1") {
+              return;
+            }
+            var themeKey =
+              "stActiveTheme-" + topWin.location.pathname + "-v2";
+            var raw = topWin.localStorage.getItem(themeKey);
+            var selection = null;
+            if (raw != null) {
+              try {
+                selection = JSON.parse(raw);
+              } catch (error) {
+                selection = null;
+              }
+            }
+            if (selection && typeof selection === "object" && selection.name) {
+              var name = String(selection.name);
+              if (/dark/i.test(name) && !/auto|system/i.test(name)) {
+                selection = "Dark";
+              } else if (/light/i.test(name) && !/auto|system/i.test(name)) {
+                selection = "Light";
+              } else {
+                selection = "System";
+              }
+            }
+            var shouldForceLight =
+              selection !== "Light" && selection !== "Dark";
+            if (shouldForceLight) {
+              topWin.localStorage.setItem(themeKey, JSON.stringify("Light"));
+              topWin.localStorage.removeItem("stActiveTheme");
+              topWin.localStorage.removeItem(
+                "stActiveTheme-" + topWin.location.pathname
+              );
+            }
+            topWin.localStorage.setItem(migrateKey, "1");
+            if (shouldForceLight && !topWin.__gpsStickThemeReloading) {
+              topWin.__gpsStickThemeReloading = true;
+              topWin.location.reload();
+            }
+          } catch (error) {
+            // localStorage may be unavailable.
+          }
+        })();
+        if (topWin.__gpsStickThemeReloading) {
+          return;
+        }
 
         // Remove any leftover Fit page control from earlier builds.
         var staleFit = topDoc.getElementById("gps-stick-fit-page");
@@ -173,23 +225,130 @@
         }
 
         // --- Fullscreen iframe + Safari chrome (always rebind) ---
-        var FULLSCREEN_STYLE = [
-          "position:fixed",
-          "inset:0",
-          "width:100vw",
-          "height:100dvh",
-          "max-width:none",
-          "max-height:none",
-          "z-index:2147483646",
-          "border:none",
-          "background:#f4f6f8",
-          "margin:0",
-          "padding:0",
-          "display:block",
-        ].join(";");
-
+        var LIGHT_CHROME = "#ffffff";
         var DARK_CHROME = "#0e1117";
-        var LIGHT_CHROME = "#f4f6f8";
+
+        function parseRgb(color) {
+          if (!color) {
+            return null;
+          }
+          var text = String(color).trim();
+          var m = text.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+          if (m) {
+            return [Number(m[1]), Number(m[2]), Number(m[3])];
+          }
+          m = text.match(/^#([0-9a-f]{6})$/i);
+          if (m) {
+            var n = parseInt(m[1], 16);
+            return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+          }
+          m = text.match(/^#([0-9a-f]{3})$/i);
+          if (m) {
+            var h = m[1];
+            return [
+              parseInt(h.charAt(0) + h.charAt(0), 16),
+              parseInt(h.charAt(1) + h.charAt(1), 16),
+              parseInt(h.charAt(2) + h.charAt(2), 16),
+            ];
+          }
+          return null;
+        }
+
+        function isDarkRgb(rgb) {
+          if (!rgb) {
+            return false;
+          }
+          var lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+          return lum < 128;
+        }
+
+        function readElementBackground(el) {
+          if (!el || !topWin.getComputedStyle) {
+            return "";
+          }
+          var styles = topWin.getComputedStyle(el);
+          var fromVar = (
+            styles.getPropertyValue("--background-color") ||
+            styles.getPropertyValue("--st-background-color") ||
+            ""
+          ).trim();
+          if (fromVar) {
+            return fromVar;
+          }
+          var bg = styles.backgroundColor || "";
+          if (bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)") {
+            return bg;
+          }
+          return "";
+        }
+
+        function getStreamlitBackground() {
+          var candidates = [
+            topDoc.querySelector('[data-testid="stAppViewContainer"]'),
+            topDoc.querySelector(".stApp"),
+            topDoc.querySelector('section.main'),
+            topDoc.body,
+            topDoc.documentElement,
+          ];
+          for (var i = 0; i < candidates.length; i += 1) {
+            var color = readElementBackground(candidates[i]);
+            if (color) {
+              return color;
+            }
+          }
+          return LIGHT_CHROME;
+        }
+
+        function detectStreamlitDark() {
+          // Prefer Streamlit's own theme cache over guessing from OS.
+          try {
+            var themeKey =
+              "stActiveTheme-" + topWin.location.pathname + "-v2";
+            var raw = topWin.localStorage.getItem(themeKey);
+            if (raw != null) {
+              var selection = JSON.parse(raw);
+              if (selection === "Dark") {
+                return true;
+              }
+              if (selection === "Light") {
+                return false;
+              }
+            }
+          } catch (error) {}
+          return isDarkRgb(parseRgb(getStreamlitBackground()));
+        }
+
+        function siteChromeDefaults() {
+          if (detectStreamlitDark()) {
+            return {
+              themeColor: DARK_CHROME,
+              colorScheme: "dark",
+              appleStatus: "black-translucent",
+            };
+          }
+          return {
+            themeColor: LIGHT_CHROME,
+            colorScheme: "light",
+            appleStatus: "default",
+          };
+        }
+
+        function buildFullscreenStyle(background) {
+          return [
+            "position:fixed",
+            "inset:0",
+            "width:100vw",
+            "height:100dvh",
+            "max-width:none",
+            "max-height:none",
+            "z-index:2147483646",
+            "border:none",
+            "background:" + (background || LIGHT_CHROME),
+            "margin:0",
+            "padding:0",
+            "display:block",
+          ].join(";");
+        }
 
         function findFrameIn(doc, childWin) {
           if (!doc) {
@@ -266,26 +425,21 @@
           };
         }
 
-        function setDarkSafariChrome(saved) {
-          var themeColor = (saved && saved.themeColor) || DARK_CHROME;
-          var colorScheme = (saved && saved.colorScheme) || "dark";
+        function setSiteSafariChrome(saved) {
+          var defaults = siteChromeDefaults();
+          var themeColor =
+            (saved && saved.themeColor) || defaults.themeColor;
+          var colorScheme =
+            (saved && saved.colorScheme) || defaults.colorScheme;
           var appleStatus =
-            (saved && saved.appleStatus) || "black-translucent";
+            (saved && saved.appleStatus) || defaults.appleStatus;
 
+          // Only touch Safari chrome metas — don't override Streamlit's
+          // document color-scheme (that fights the Settings theme picker).
           replaceMeta("theme-color", themeColor);
           replaceMeta("color-scheme", colorScheme);
           replaceMeta("apple-mobile-web-app-status-bar-style", appleStatus);
 
-          if (topDoc.documentElement) {
-            topDoc.documentElement.style.colorScheme =
-              (saved && saved.htmlColorScheme) || "dark";
-          }
-          if (topDoc.body) {
-            topDoc.body.style.colorScheme =
-              (saved && saved.bodyColorScheme) || "dark";
-          }
-
-          // Second pass: Safari sometimes samples chrome after layout settles.
           setTimeout(function () {
             replaceMeta("theme-color", themeColor);
             replaceMeta("color-scheme", colorScheme);
@@ -293,29 +447,25 @@
         }
 
         function applySafariChromeTheme(active) {
-          // Light arrow fullscreen makes Safari paint white status/home areas.
-          // Restore Streamlit's dark chrome when leaving fullscreen.
           if (active) {
             if (!topWin.__gpsStickSavedChrome) {
               captureChromeTheme();
             }
-            replaceMeta("theme-color", LIGHT_CHROME);
-            replaceMeta("color-scheme", "light");
-            replaceMeta("apple-mobile-web-app-status-bar-style", "default");
-            if (topDoc.documentElement) {
-              topDoc.documentElement.style.colorScheme = "light";
-            }
-            if (topDoc.body) {
-              topDoc.body.style.colorScheme = "light";
-            }
+            var defaults = siteChromeDefaults();
+            replaceMeta("theme-color", defaults.themeColor);
+            replaceMeta("color-scheme", defaults.colorScheme);
+            replaceMeta(
+              "apple-mobile-web-app-status-bar-style",
+              defaults.appleStatus
+            );
             return;
           }
 
-          setDarkSafariChrome(topWin.__gpsStickSavedChrome || null);
+          setSiteSafariChrome(topWin.__gpsStickSavedChrome || null);
           topWin.__gpsStickSavedChrome = null;
         }
 
-        function setFrameFullscreen(frame, active) {
+        function setFrameFullscreen(frame, active, background) {
           if (!frame) {
             return;
           }
@@ -324,11 +474,30 @@
               frame.dataset.gpsStickFs = frame.getAttribute("style") || "";
             }
             frame.setAttribute("data-gps-stick-fs-active", "1");
-            frame.style.cssText = FULLSCREEN_STYLE;
+            frame.style.cssText = buildFullscreenStyle(background);
           } else if (frame.getAttribute("data-gps-stick-fs-active") === "1") {
             frame.style.cssText = frame.dataset.gpsStickFs || "";
             delete frame.dataset.gpsStickFs;
             frame.removeAttribute("data-gps-stick-fs-active");
+          }
+        }
+
+        function notifyNavFullscreenTheme(sourceWin, active, background, dark) {
+          if (!sourceWin || typeof sourceWin.postMessage !== "function") {
+            return;
+          }
+          try {
+            sourceWin.postMessage(
+              {
+                type: "gps-stick-nav-fullscreen-theme",
+                active: !!active,
+                background: background || LIGHT_CHROME,
+                dark: !!dark,
+              },
+              "*"
+            );
+          } catch (error) {
+            // Source frame may be gone.
           }
         }
 
@@ -341,17 +510,26 @@
             return;
           }
           var active = !!data.active;
+          var dark = detectStreamlitDark();
+          var background = getStreamlitBackground();
+          // Trust Light/Dark preference over a mis-read DOM color.
+          if (dark && !isDarkRgb(parseRgb(background))) {
+            background = DARK_CHROME;
+          } else if (!dark && isDarkRgb(parseRgb(background))) {
+            background = LIGHT_CHROME;
+          }
           var chain = collectAncestorFrames(event.source);
           for (var i = 0; i < chain.length; i += 1) {
-            setFrameFullscreen(chain[i], active);
+            setFrameFullscreen(chain[i], active, background);
           }
           applySafariChromeTheme(active);
+          notifyNavFullscreenTheme(event.source, active, background, dark);
         };
         topWin.addEventListener("message", topWin.__gpsStickNavFsHandler);
 
-        // Establish dark Safari chrome unless arrow fullscreen is already open.
+        // Match Safari chrome to the active Streamlit theme (light by default).
         if (!topDoc.querySelector('iframe[data-gps-stick-fs-active="1"]')) {
-          setDarkSafariChrome(null);
+          setSiteSafariChrome(null);
         }
       })();
     </script>

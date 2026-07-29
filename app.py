@@ -259,6 +259,9 @@ def generate_grid(
     return grid
 
 
+ENDLESS_NEAREST_COUNT = 7
+
+
 def generate_nearest_endless_grid_points(
     origin_lat,
     origin_lon,
@@ -267,7 +270,7 @@ def generate_nearest_endless_grid_points(
     spacing_meters,
     orientation_deg=0,
     staggered=True,
-    count=4,
+    count=ENDLESS_NEAREST_COUNT,
 ):
     """Return the closest `count` points in the infinite, oriented lattice."""
     count = max(1, int(count))
@@ -345,7 +348,7 @@ def build_active_grid_df(user_lat, user_lon, line_count_m, line_count_e, spacing
             spacing,
             orientation,
             staggered,
-            count=4,
+            count=ENDLESS_NEAREST_COUNT,
         )
         return df, center
     return (
@@ -508,7 +511,7 @@ def post_user_position_update(user_lat, user_lon, session_key):
 
 
 def post_endless_grid_window_if_needed(user_lat, user_lon):
-    """Refresh the live endless lattice when the nearest-4 set changes."""
+    """Refresh the live endless lattice when the nearest-N set changes."""
     if not st.session_state.get("grid_finalized"):
         return
     if not st.session_state.get("grid_endless", True):
@@ -1166,9 +1169,13 @@ def _lon_step_deg(lat, step_m=ORIGIN_STEP_M):
 
 
 def freeze_placement_user_position(lat, lon):
-    """Pin the placement-screen user marker (no live tracking until finalize)."""
+    """Pin the placement-screen user marker (no continuous live tracking)."""
     st.session_state.placement_user_lat = float(lat)
     st.session_state.placement_user_lon = float(lon)
+
+
+PLACEMENT_USER_RECHECK_S = 10.0
+PLACEMENT_USER_MOVE_THRESHOLD_M = 10.0
 
 
 def placement_user_latlon():
@@ -1538,7 +1545,7 @@ with st.sidebar:
             key="grid_endless",
             help=(
                 "Infinite lattice locked at finalize. The live field view displays "
-                "the four nearest lattice points. Visited points stay yellow. "
+                f"the {ENDLESS_NEAREST_COUNT} nearest lattice points. Visited points stay yellow. "
                 "Placement preview uses a fixed 4×4 neighborhood."
             ),
         )
@@ -1939,7 +1946,9 @@ if not st.session_state.grid_finalized:
     st.caption(
         "Pan and zoom to place the origin, or set **latitude / longitude** "
         f"(+/- steps ≈ {ORIGIN_STEP_M:.0f} m) and **Grid heading** in the sidebar. "
-        "Your position marker stays fixed at the first GPS reading until you finalize. "
+        "Your position marker starts at the first GPS reading and only moves if a "
+        f"later fix is more than {PLACEMENT_USER_MOVE_THRESHOLD_M:.0f} m away "
+        f"(checked every {PLACEMENT_USER_RECHECK_S:.0f} s). "
         "The grid origin (green) stays at the map center. "
         "Click **Finalize grid location** to confirm."
     )
@@ -1998,6 +2007,24 @@ if not st.session_state.grid_finalized:
                     queue_grid_heading_input(bearing)
 
     placement_map_fragment()
+
+    @st.fragment(run_every=PLACEMENT_USER_RECHECK_S)
+    def refresh_placement_user_marker():
+        """Every 10s, move the red marker if GPS has drifted more than 10 m."""
+        poll_gps(timeout_s=0.25)
+        coords = latest_gps_fix()
+        if coords is None:
+            return
+        frozen_lat, frozen_lon = placement_user_latlon()
+        distance_m, _ = get_distance_and_bearing(
+            frozen_lat, frozen_lon, coords[0], coords[1]
+        )
+        if distance_m <= PLACEMENT_USER_MOVE_THRESHOLD_M:
+            return
+        freeze_placement_user_position(coords[0], coords[1])
+        post_user_position_update(coords[0], coords[1], "placement_user_pos")
+
+    refresh_placement_user_marker()
 
     col_info, col_finalize = st.columns([2, 1])
     with col_info:

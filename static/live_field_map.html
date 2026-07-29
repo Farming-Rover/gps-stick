@@ -592,7 +592,7 @@
             lon: Number(point.lon),
           });
         });
-        // Visited points persist even after they leave the nearest-4 window.
+        // Visited points persist even after they leave the nearest-N window.
         visitedPoints.forEach((coords, name) => {
           if (!byName.has(name)) {
             byName.set(name, {

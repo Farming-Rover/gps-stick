@@ -21,6 +21,7 @@
         height: 100%;
         height: 100dvh;
         overflow: hidden;
+        background: var(--fs-bg, #ffffff);
       }
 
       .panel {
@@ -282,11 +283,10 @@
         border-radius: 0;
         z-index: 9999;
         justify-content: center;
-        /* Force light surface: some phones paint a black fullscreen
-           backdrop while our distance text stays dark (#111). */
-        background: #f4f6f8 !important;
-        color: #111 !important;
-        color-scheme: light;
+        /* Match Streamlit theme background while fullscreen only. */
+        background: var(--fs-bg, #ffffff) !important;
+        color: var(--fs-fg, #111) !important;
+        color-scheme: var(--fs-scheme, light);
         box-sizing: border-box;
       }
 
@@ -322,34 +322,34 @@
       .panel.is-fullscreen .distance-value,
       .panel:fullscreen .distance-value,
       .panel:-webkit-full-screen .distance-value {
-        color: #111 !important;
-        -webkit-text-fill-color: #111;
+        color: var(--fs-fg, #111) !important;
+        -webkit-text-fill-color: var(--fs-fg, #111);
         font-size: 64px;
       }
 
       .panel.is-fullscreen .distance-block,
       .panel:fullscreen .distance-block,
       .panel:-webkit-full-screen .distance-block {
-        color: #111;
+        color: var(--fs-fg, #111);
       }
 
       .panel.is-fullscreen .status,
       .panel:fullscreen .status,
       .panel:-webkit-full-screen .status {
-        color: #444 !important;
+        color: var(--fs-muted, #444) !important;
       }
 
       .panel.is-fullscreen .tolerance-row,
       .panel:fullscreen .tolerance-row,
       .panel:-webkit-full-screen .tolerance-row {
-        color: #555 !important;
+        color: var(--fs-muted, #555) !important;
       }
 
       .panel.is-fullscreen .tolerance-row input,
       .panel:fullscreen .tolerance-row input,
       .panel:-webkit-full-screen .tolerance-row input {
-        color: #222 !important;
-        background: #fff !important;
+        color: var(--fs-input-fg, #222) !important;
+        background: var(--fs-input-bg, #fff) !important;
       }
     </style>
   </head>
@@ -811,8 +811,44 @@
 
       let parentPseudoFullscreen = false;
 
+      function clearFullscreenThemeVars() {
+        const root = document.documentElement;
+        root.style.removeProperty("--fs-bg");
+        root.style.removeProperty("--fs-fg");
+        root.style.removeProperty("--fs-muted");
+        root.style.removeProperty("--fs-input-fg");
+        root.style.removeProperty("--fs-input-bg");
+        root.style.removeProperty("--fs-scheme");
+      }
+
+      function applyFullscreenTheme(payload) {
+        const root = document.documentElement;
+        if (!payload || !payload.active) {
+          clearFullscreenThemeVars();
+          return;
+        }
+        const dark = !!payload.dark;
+        root.style.setProperty("--fs-bg", payload.background || "#ffffff");
+        root.style.setProperty("--fs-fg", dark ? "#fafafa" : "#111");
+        root.style.setProperty("--fs-muted", dark ? "#c2c5cc" : "#444");
+        root.style.setProperty("--fs-input-fg", dark ? "#fafafa" : "#222");
+        root.style.setProperty("--fs-input-bg", dark ? "#262730" : "#fff");
+        root.style.setProperty("--fs-scheme", dark ? "dark" : "light");
+      }
+
+      window.addEventListener("message", function (event) {
+        const data = event.data;
+        if (!data || data.type !== "gps-stick-nav-fullscreen-theme") {
+          return;
+        }
+        applyFullscreenTheme(data);
+      });
+
       function setParentPseudoFullscreen(active) {
         parentPseudoFullscreen = !!active;
+        if (!parentPseudoFullscreen) {
+          clearFullscreenThemeVars();
+        }
         const payload = {
           type: "gps-stick-nav-fullscreen",
           active: parentPseudoFullscreen,
@@ -858,6 +894,9 @@
         document.documentElement.classList.toggle("is-fullscreen", !!active);
         document.body.classList.toggle("is-fullscreen", !!active);
         panel.classList.toggle("is-fullscreen", !!active);
+        if (!active) {
+          clearFullscreenThemeVars();
+        }
       }
 
       async function toggleFullscreen() {
