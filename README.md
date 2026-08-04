@@ -43,8 +43,8 @@ Notes:
 
 ### Software stack on the Pi
 
-- Raspberry Pi OS
-- Python 3 with a virtualenv (recommended)
+- Raspberry Pi OS (32-bit on the Pi Zero)
+- Python 3 (system packages; see Streamlit install notes below)
 - Streamlit app (`app.py`) serving the UI on the LAN
 - Optional: NTRIP client (built into the app) for RTK corrections from a caster such as RTK2GO
 
@@ -71,17 +71,48 @@ Notes:
 
 ## Setup
 
-### Dependencies
+### Dependencies (Raspberry Pi Zero / 32-bit)
 
-On the Pi (example):
+The Pi Zero is **32-bit (ARMv6)** and cannot use Streamlit’s normal `pip install streamlit` path: that pulls **PyArrow**, which has no suitable prebuilt wheel for this CPU, and the Zero does not have enough RAM to compile PyArrow from source.
+
+Instead, install Streamlit **without its dependency set**, then install only what the app needs by hand:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install streamlit pyserial pynmea2 pandas
+pip install streamlit --no-deps --break-system-packages
 ```
 
-Adjust versions as needed for your Pi OS / Python build. PyArrow is not required for the placement map path used here.
+Also install app libraries (serial / NMEA / data), for example:
+
+```bash
+pip install pyserial pynmea2 pandas --break-system-packages
+```
+
+Then install the Streamlit runtime pieces that `--no-deps` skipped (names as used on this project):
+
+| Package | Role |
+|---------|------|
+| `starlette` | Async web framework / routing layer |
+| `uvicorn` | ASGI web server |
+| `anyio` | Async I/O stack for Starlette |
+| `tenacity` | Retries for server calls |
+| `itsdangerous` | Data signing / security helpers |
+| `toml` | Config parser |
+| `websockets` | Real-time browser communication |
+| `python-multipart` | Streaming form parser |
+| `gitpython` | Git repository checker |
+| `protobuf`, `altair`, `pydeck`, `narwhals` | Visualization / data-layer deps Streamlit expects |
+
+Example:
+
+```bash
+pip install starlette uvicorn anyio tenacity itsdangerous toml \
+  websockets python-multipart gitpython protobuf altair pydeck narwhals \
+  --break-system-packages
+```
+
+**Do not install PyArrow** on the Zero. This app’s custom map components use a JSON-only path so Streamlit can run without it.
+
+`--break-system-packages` is used here because the Zero setup installs into the system Python; prefer a venv on machines that can resolve dependencies normally (e.g. a 64-bit Pi or PC).
 
 ### Run
 
