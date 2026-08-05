@@ -27,7 +27,7 @@
       .map-shell {
         position: relative;
         width: 100%;
-        height: 520px;
+        height: 100%;
       }
 
       .map-hud {
@@ -255,6 +255,9 @@
         });
       }
 
+      // Freshest heading sample for map-follow lerp (not gated by cone deadband).
+      let latestFollowHeading = null;
+
       function applyExternalHeading(heading) {
         const next = Number(heading);
         if (!Number.isFinite(next)) {
@@ -264,7 +267,9 @@
         if (sensorIssue === "no-compass") {
           sensorIssue = null;
         }
-        MAP_CONFIG.user_heading = ((next % 360) + 360) % 360;
+        const normalized = ((next % 360) + 360) % 360;
+        latestFollowHeading = normalized;
+        MAP_CONFIG.user_heading = normalized;
         drawUserMarker();
       }
 
@@ -285,6 +290,33 @@
           Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
         const bearing = (Math.atan2(y, x) * 180) / Math.PI;
         return { distance, bearing: (bearing + 360) % 360 };
+      }
+
+      function getFollowTargetHeading() {
+        if (Number.isFinite(latestFollowHeading)) {
+          return ((latestFollowHeading % 360) + 360) % 360;
+        }
+        const heading = Number(MAP_CONFIG.user_heading);
+        if (!Number.isFinite(heading)) {
+          return null;
+        }
+        return ((heading % 360) + 360) % 360;
+      }
+
+      function centerMapOnUser(animate) {
+        if (!map || !followHeading) {
+          return;
+        }
+        const lat = Number(MAP_CONFIG.user_lat);
+        const lon = Number(MAP_CONFIG.user_lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+          return;
+        }
+        map.panTo([lat, lon], {
+          animate: !!animate,
+          duration: animate ? 0.2 : 0,
+          noMoveStart: true,
+        });
       }
 
       function getRelativeDirection(userHeading, bearingToTarget) {
@@ -762,19 +794,18 @@
       let headingCos = null;
       let headingFilterReady = false;
       let headingRefreshTimer = null;
-      let mapBearingTimer = null;
       let lastAppliedMapBearing = null;
       // Higher = snappier (closer to raw). Still an EMA on sin/cos so wrap and
       // magnetometer jitter stay filtered instead of driving the UI raw.
       const HEADING_SMOOTHING = 0.35;
-      // Cone + nav arrow refresh (~10 Hz). Map follow stays on its own ~30 fps
-      // loop. Latency came mostly from the old 0.5 Hz UI sample + 1.8s CSS ease.
+      // Cone + nav arrow refresh (~10 Hz). Map follow uses rAF + angle lerp.
       const HEADING_REFRESH_MS = 100;
-      const MAP_BEARING_MS = 1000 / 30;
       // Ignore stillness wiggle, but start tracking real turns sooner than 3°.
       const HEADING_DEADBAND_DEG = 1.5;
-      // Tiny map deadband so 30 fps still feels continuous but skips noise.
-      const MAP_BEARING_DEADBAND_DEG = 0.35;
+      const MAP_BEARING_LERP = 0.28;
+      const MAP_BEARING_APPLY_EPS_DEG = 0.05;
+      let mapHeadingDisplay = null;
+      let mapBearingRaf = null;
 
       function getSmoothedHeading() {
         if (!headingFilterReady) {
@@ -790,6 +821,7 @@
         if (smoothed == null) {
           return;
         }
+        latestFollowHeading = smoothed;
         const previous = Number(MAP_CONFIG.user_heading);
         if (Number.isFinite(previous)) {
           const delta = Math.abs(((smoothed - previous + 540) % 360) - 180);
@@ -798,7 +830,7 @@
           }
         }
         MAP_CONFIG.user_heading = smoothed;
-        // Map bearing is driven by the 30 fps loop when followHeading is on.
+        // Map bearing is driven by the follow rAF loop when followHeading is on.
         drawUserMarker();
       }
 
@@ -811,21 +843,29 @@
         ) {
           return;
         }
-        const smoothed = getSmoothedHeading();
-        if (smoothed == null) {
+        const trueHeading = getFollowTargetHeading();
+        if (trueHeading == null) {
           return;
         }
+        if (mapHeadingDisplay == null) {
+          mapHeadingDisplay = trueHeading;
+        } else {
+          const delta =
+            ((trueHeading - mapHeadingDisplay + 540) % 360) - 180;
+          mapHeadingDisplay =
+            (mapHeadingDisplay + delta * MAP_BEARING_LERP + 360) % 360;
+        }
         if (lastAppliedMapBearing != null) {
-          const delta = Math.abs(
-            ((smoothed - lastAppliedMapBearing + 540) % 360) - 180
+          const moved = Math.abs(
+            ((mapHeadingDisplay - lastAppliedMapBearing + 540) % 360) - 180
           );
-          if (delta < MAP_BEARING_DEADBAND_DEG) {
+          if (moved < MAP_BEARING_APPLY_EPS_DEG) {
             return;
           }
         }
-        lastAppliedMapBearing = smoothed;
+        lastAppliedMapBearing = mapHeadingDisplay;
         // leaflet-rotate pane angle is opposite screen-up; put heading at top.
-        map.setBearing((360 - smoothed) % 360);
+        map.setBearing((360 - mapHeadingDisplay) % 360);
       }
 
       function startHeadingRefreshTimer() {
@@ -843,21 +883,31 @@
         }
       }
 
+      function mapBearingFrame() {
+        mapBearingRaf = null;
+        if (!followHeading) {
+          return;
+        }
+        applyMapBearing();
+        mapBearingRaf = requestAnimationFrame(mapBearingFrame);
+      }
+
       function startMapBearingTimer() {
-        if (mapBearingTimer != null) {
+        if (mapBearingRaf != null) {
           return;
         }
         lastAppliedMapBearing = null;
-        applyMapBearing();
-        mapBearingTimer = setInterval(applyMapBearing, MAP_BEARING_MS);
+        mapHeadingDisplay = null;
+        mapBearingRaf = requestAnimationFrame(mapBearingFrame);
       }
 
       function stopMapBearingTimer() {
-        if (mapBearingTimer != null) {
-          clearInterval(mapBearingTimer);
-          mapBearingTimer = null;
+        if (mapBearingRaf != null) {
+          cancelAnimationFrame(mapBearingRaf);
+          mapBearingRaf = null;
         }
         lastAppliedMapBearing = null;
+        mapHeadingDisplay = null;
       }
 
       function updateFollowToggleUi() {
@@ -868,11 +918,12 @@
         btn.classList.toggle("active", followHeading);
         if (followHeading) {
           btn.textContent = "Map: follows heading";
-          btn.title = "Map rotates so the direction you face is always up";
+          btn.title =
+            "Map stays centered on you and rotates so facing is always up";
         } else {
           btn.textContent = "Map: free rotate";
           btn.title =
-            "Map stays where you leave it; rotate with two fingers. Cone shows heading.";
+            "Map stays where you leave it; pan/rotate freely. Cone shows heading.";
         }
       }
 
@@ -880,15 +931,22 @@
         followHeading = !!enabled;
         if (map) {
           if (followHeading) {
+            if (map.dragging && map.dragging.disable) {
+              map.dragging.disable();
+            }
             if (map.touchRotate && map.touchRotate.disable) {
               map.touchRotate.disable();
             }
             if (map.shiftKeyRotate && map.shiftKeyRotate.disable) {
               map.shiftKeyRotate.disable();
             }
+            centerMapOnUser(false);
             startMapBearingTimer();
           } else {
             stopMapBearingTimer();
+            if (map.dragging && map.dragging.enable) {
+              map.dragging.enable();
+            }
             if (map.touchRotate && map.touchRotate.enable) {
               map.touchRotate.enable();
             }
@@ -1022,6 +1080,9 @@
           }
           MAP_CONFIG.user_lat = nextLat;
           MAP_CONFIG.user_lon = nextLon;
+          if (followHeading) {
+            centerMapOnUser(false);
+          }
           drawUserMarker();
           return;
         }
@@ -1059,6 +1120,26 @@
           position: "topleft",
         },
       });
+
+      function syncMapSize() {
+        if (!map) {
+          return;
+        }
+        map.invalidateSize({ animate: false });
+        if (followHeading) {
+          centerMapOnUser(false);
+        }
+      }
+      requestAnimationFrame(syncMapSize);
+      setTimeout(syncMapSize, 100);
+      setTimeout(syncMapSize, 400);
+      window.addEventListener("resize", syncMapSize);
+      if (typeof ResizeObserver !== "undefined") {
+        const shell = document.querySelector(".map-shell");
+        if (shell) {
+          new ResizeObserver(syncMapSize).observe(shell);
+        }
+      }
 
       // Drive "compass follow" from our own heading filter (handles iOS/Android
       // quirks). Hijack the plugin handler so the rotate control's orange
@@ -1113,7 +1194,7 @@
       });
       map.on("rotate", () => {
         // In follow mode the cone stays screen-up (target 0) and the map
-        // turns underneath at 30 fps — skip cone work on every rotate tick.
+        // turns underneath via rAF lerp — skip cone work on every rotate tick.
         if (!mapBusyWithZoom() && !followHeading) {
           updateFacingCone();
         }
