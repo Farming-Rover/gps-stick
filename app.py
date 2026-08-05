@@ -382,12 +382,82 @@ def _static_html(name: str) -> str:
     return _load_static_html(name, path.stat().st_mtime)
 
 
+def ensure_live_iframes_match_static():
+    """Remount live nav/map iframes when their HTML changes on disk.
+
+    Mounted iframes keep running the JS they loaded at mount time, so after a
+    deploy (scp) the phone silently runs stale code — this is why earlier
+    heading fixes appeared to have no effect in the field. Comparing file
+    mtimes each run forces a remount whenever the deployed HTML changes.
+    """
+    nav_mtime = (_STATIC_DIR / "live_nav_panel.html").stat().st_mtime_ns
+    map_mtime = (_STATIC_DIR / "live_field_map.html").stat().st_mtime_ns
+    changed = False
+    if st.session_state.get("live_nav_static_mtime") != nav_mtime:
+        st.session_state.live_nav_static_mtime = nav_mtime
+        changed = True
+    if st.session_state.get("live_map_static_mtime") != map_mtime:
+        st.session_state.live_map_static_mtime = map_mtime
+        changed = True
+    if changed:
+        invalidate_live_views()
+
+
+def live_view_seq() -> int:
+    return int(st.session_state.get("live_view_seq", 0))
+
+
+def invalidate_live_views():
+    """Force the live nav panel and field map iframes to remount next render."""
+    st.session_state.live_view_seq = live_view_seq() + 1
+    st.session_state.pop("live_map_seed", None)
+    st.session_state.pop("last_posted_rtk_status", None)
+    # Legacy flags from the old mount-once path.
+    st.session_state.live_nav_panel_mounted = False
+    st.session_state.live_map_mounted = False
+
+
+def handle_live_wake_remount():
+    """Remount live views after phone lock / tab suspend (see shell_bridge)."""
+    wake = None
+    try:
+        wake = st.query_params.get("gps_stick_wake")
+    except Exception:
+        wake = None
+    if wake is None:
+        return
+    wake_key = str(wake)
+    if st.session_state.get("handled_live_wake") == wake_key:
+        return
+    st.session_state.handled_live_wake = wake_key
+    invalidate_live_views()
+    try:
+        del st.query_params["gps_stick_wake"]
+    except Exception:
+        pass
+
+
 def _app_shell_css() -> str:
     """Parent-page CSS only (Streamlit strips <script> from markdown HTML)."""
     return """
     <style>
     [data-testid="stElementContainer"][data-stale="true"]:has(iframe.stCustomComponentV1) {
         opacity: 1 !important;
+    }
+    /* Broadcast-only messenger iframes (GPS/RTK/heading pushes) execute at
+       height 0. Collapse their Streamlit wrappers so fragment refreshes cannot
+       flash white separator lines between the nav panel and field map. */
+    [data-testid="stElementContainer"]:has(iframe[height="0"]),
+    [data-testid="stElementContainer"]:has(iframe[style*="height: 0"]),
+    [data-testid="stElementContainer"]:has(iframe[style*="height:0"]),
+    [data-testid="stElementContainer"]:has([data-gps-stick-msg]) {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        overflow: hidden !important;
     }
     /* Keep the sidebar collapse chevron visible (not hover-only). */
     [data-testid="stSidebarCollapseButton"],
@@ -443,57 +513,60 @@ def render_live_field_map(
         f"{1 if st.session_state.get('grid_staggered', True) else 0},"
         f"{1 if st.session_state.get('grid_endless', True) else 0}"
     )
+    # Seed position once per view generation so full script reruns keep the same
+    # iframe HTML (GPS updates arrive over BroadcastChannel instead).
+    seed = st.session_state.get("live_map_seed")
+    if not isinstance(seed, dict) or seed.get("seq") != live_view_seq():
+        seed = {
+            "seq": live_view_seq(),
+            "user_lat": float(user_lat) if user_lat is not None else None,
+            "user_lon": float(user_lon) if user_lon is not None else None,
+            "center_lat": float(center_lat),
+            "center_lon": float(center_lon),
+            "zoom": int(zoom),
+            "grid_id": grid_id,
+            "grid_points": grid_points,
+        }
+        st.session_state.live_map_seed = seed
     config = {
-        "grid_points": grid_points,
-        "grid_id": grid_id,
+        "grid_points": seed["grid_points"],
+        "grid_id": seed["grid_id"],
         "target_point": None,
         "target_lat": None,
         "target_lon": None,
-        "user_lat": user_lat,
-        "user_lon": user_lon,
+        "user_lat": seed["user_lat"],
+        "user_lon": seed["user_lon"],
         "user_heading": None,
         "user_accuracy": None,
         "reach_tolerance_m": 0.015,
-        "center_lat": center_lat,
-        "center_lon": center_lon,
-        "zoom": zoom,
+        "center_lat": seed["center_lat"],
+        "center_lon": seed["center_lon"],
+        "zoom": seed["zoom"],
     }
     html = (
         _static_html("live_field_map.html")
         .replace("__MAP_CONFIG_B64__", _encode_map_payload(config))
         .replace("__MAP_MESSAGE_TYPE__", json.dumps(MAP_MESSAGE_TYPE))
+        .replace("__VIEW_SEQ__", str(live_view_seq()))
     )
     render_html_embed(html, height=height)
 
 
 def render_live_nav_panel(height=460):
-    status = get_latest_rtk_status()
-    label = status.get("rtk_label") or "Waiting for GPS…"
-    css = status.get("rtk_class") or "unknown"
-    sats = status.get("num_sats")
-    try:
-        sats_i = int(sats) if sats is not None else 0
-    except (TypeError, ValueError):
-        sats_i = 0
-    sats_note = f" · {sats_i} sats" if sats_i > 0 else ""
+    # Keep the embedded HTML stable across reruns so Streamlit does not remount
+    # the iframe on every script run. Live RTK text is pushed over BroadcastChannel.
     html = (
         _static_html("live_nav_panel.html")
-        .replace("__RTK_BAR_CLASS__", css)
-        .replace("__RTK_BAR_LABEL__", f"{label}{sats_note}")
+        .replace("__RTK_BAR_CLASS__", "unknown")
+        .replace("__RTK_BAR_LABEL__", "Waiting for GPS…")
+        .replace("__VIEW_SEQ__", str(live_view_seq()))
     )
     render_html_embed(html, height=height)
-    # Match the seeded bar so the next poll only posts when quality changes.
-    st.session_state.last_posted_rtk_status = (
-        status.get("gps_qual"),
-        status.get("rtk_label"),
-        status.get("num_sats"),
-    )
 
 
 def invalidate_live_nav_panel():
     """Force the live nav iframe to remount and re-sync RTK status."""
-    st.session_state.live_nav_panel_mounted = False
-    st.session_state.pop("last_posted_rtk_status", None)
+    invalidate_live_views()
 
 
 def post_user_position_update(user_lat, user_lon, session_key):
@@ -1675,13 +1748,13 @@ with st.sidebar:
 
     st.header("NTRIP")
 
-    # During placement, poll NTRIP status less often so sidebar buttons stay snappy.
-    _ntrip_refresh_s = 1.0 if st.session_state.get("grid_finalized") else 3.0
+    # Status can refresh on a timer; interactive controls must NOT live inside
+    # run_every — otherwise Connect/Disconnect clicks race the timer and feel
+    # stuck for seconds on a Pi Zero.
+    _ntrip_status_refresh_s = 1.5 if st.session_state.get("grid_finalized") else 3.0
 
-    @st.fragment(run_every=_ntrip_refresh_s)
+    @st.fragment
     def render_ntrip_controls():
-        # Keep the serial RX drained (and NTRIP GGA fed) without a busy placement loop.
-        poll_gps(timeout_s=0.0)
         status = get_ntrip_status()
         active = status.get("desired")
         active_key = status.get("desired_key")
@@ -1692,10 +1765,17 @@ with st.sidebar:
                 if (active or {}).get("source") == "local"
                 else "RTK2GO"
             )
-        if st.session_state.get("ntrip_mountpoint_input") is None:
-            st.session_state.ntrip_mountpoint_input = (
-                (active or {}).get("mountpoint") or NTRIP_DEFAULT_MOUNTPOINT
-            )
+        # Seed the default mountpoint once per browser session.
+        # Do not use `is None` alone: on Android Chrome the keyed text_input often
+        # registers as "" on first paint (Safari usually leaves the key absent).
+        # "" is not None, so the old check skipped the default and left the box blank.
+        if not st.session_state.get("ntrip_mountpoint_seeded"):
+            existing = st.session_state.get("ntrip_mountpoint_input")
+            if not (isinstance(existing, str) and existing.strip()):
+                st.session_state.ntrip_mountpoint_input = (
+                    (active or {}).get("mountpoint") or NTRIP_DEFAULT_MOUNTPOINT
+                )
+            st.session_state.ntrip_mountpoint_seeded = True
         if "ntrip_local_host" not in st.session_state:
             st.session_state.ntrip_local_host = (
                 ((active or {}).get("host") or "")
@@ -1768,7 +1848,6 @@ with st.sidebar:
             key="ntrip_mountpoint_input",
             help=mount_help,
         )
-   
 
         try:
             requested_target = _normalize_ntrip_target(
@@ -1823,12 +1902,14 @@ with st.sidebar:
                         password=requested_target["password"],
                         source=requested_target["source"],
                     )
+                    st.rerun(scope="fragment")
                 except ValueError as exc:
                     st.error(str(exc))
         with col_disconnect:
             if st.button("Disconnect", use_container_width=True):
                 st.session_state.pop("ntrip_pending_switch", None)
                 stop_ntrip()
+                st.rerun(scope="fragment")
 
         pending_key = ntrip_rt.target_key(pending_switch) if pending_switch else None
         if pending_key and active_key and pending_key != active_key:
@@ -1858,6 +1939,19 @@ with st.sidebar:
                     st.session_state.pop("ntrip_pending_switch", None)
                     st.rerun(scope="fragment")
 
+        if source == "local":
+            st.caption("Local caster · auth only sent when a username is set")
+        else:
+            st.caption(
+                f"Caster: {NTRIP_HOST}:{NTRIP_PORT} · user: {NTRIP_USER_EMAIL}"
+            )
+
+    @st.fragment(run_every=_ntrip_status_refresh_s)
+    def render_ntrip_status():
+        # Non-blocking drain so GGA keeps feeding the caster without holding up
+        # Connect/Disconnect in the controls fragment.
+        poll_gps(timeout_s=0.0)
+        status = get_ntrip_status()
         state = status.get("state", "idle")
         message = status.get("message", "")
         streaming = bool(status.get("streaming"))
@@ -1870,14 +1964,8 @@ with st.sidebar:
         else:
             st.caption(message)
 
-        if source == "local":
-            st.caption("Local caster · auth only sent when a username is set")
-        else:
-            st.caption(
-                f"Caster: {NTRIP_HOST}:{NTRIP_PORT} · user: {NTRIP_USER_EMAIL}"
-            )
-
     render_ntrip_controls()
+    render_ntrip_status()
 
     st.header("Saved grids")
 
@@ -1946,14 +2034,11 @@ if not st.session_state.grid_finalized:
     st.caption(
         "Pan and zoom to place the origin, or set **latitude / longitude** "
         f"(+/- steps ≈ {ORIGIN_STEP_M:.0f} m) and **Grid heading** in the sidebar. "
-        "Your position marker starts at the first GPS reading and only moves if a "
-        f"later fix is more than {PLACEMENT_USER_MOVE_THRESHOLD_M:.0f} m away "
-        f"(checked every {PLACEMENT_USER_RECHECK_S:.0f} s). "
         "The grid origin (green) stays at the map center. "
-        "Click **Finalize grid location** to confirm."
+        "Click **Finalize grid location** or load a saved grid to go to field navigation"
     )
 
-    # The map lives in a fragment so each pan-end (which reports the new
+    # The map lives in a fragment 3so each pan-end (which reports the new
     # origin as a component value) reruns only this block, not the whole
     # script. That keeps reruns fast on the Pi and the UI steady.
     @st.fragment
@@ -2049,16 +2134,23 @@ else:
 
     st.subheader("Live Navigation")
 
-    if not st.session_state.get("live_nav_panel_mounted"):
-        render_live_nav_panel(height=520)
-        st.session_state.live_nav_panel_mounted = True
-        # Remount can race the BroadcastChannel listener; force a follow-up
-        # push so the bar does not stick on the HTML default.
-        post_rtk_status_update(force=True)
+    # Phone lock / Safari suspend can discard iframes while session flags still
+    # claim they are mounted. Always re-emit them (stable HTML + view seq), and
+    # remount after a long background via shell_bridge's wake marker.
+    handle_live_wake_remount()
+    ensure_live_iframes_match_static()
 
-    @st.fragment(run_every=0.25)
+    view_seq = live_view_seq()
+    remounting = st.session_state.get("live_ui_emitted_seq") != view_seq
+
+    render_live_nav_panel(height=520)
+
+    # 0.5 s is enough for nav updates and leaves the Pi free for sidebar clicks.
+    @st.fragment(run_every=0.5)
     def refresh_live_user_marker():
-        poll_gps(timeout_s=0.1)
+        # Non-blocking drain: never sleep waiting for serial while the user may
+        # be tapping sidebar controls in parallel.
+        poll_gps(timeout_s=0.0)
         coords = latest_gps_fix()
         post_rtk_status_update()
         if coords is None:
@@ -2077,17 +2169,22 @@ else:
         "Secondary map for skip-toggles and context. "
         "Compass-follow rotates the view while grid points stay locked to the ground."
     )
-    if not st.session_state.get("live_map_mounted"):
-        render_live_field_map(
-            grid_points=grid_points,
-            user_lat=current_lat,
-            user_lon=current_lon,
-            center_lat=current_lat,
-            center_lon=current_lon,
-            zoom=19,
-            height=260,
-        )
-        st.session_state.live_map_mounted = True
+    render_live_field_map(
+        grid_points=grid_points,
+        user_lat=current_lat,
+        user_lon=current_lon,
+        center_lat=current_lat,
+        center_lon=current_lon,
+        zoom=19,
+        height=260,
+    )
+    if remounting:
+        st.session_state.live_ui_emitted_seq = view_seq
+        st.session_state.pop("last_posted_rtk_status", None)
+        st.session_state.pop("live_user_pos", None)
+        post_rtk_status_update(force=True)
+        if current_lat is not None and current_lon is not None:
+            post_user_position_update(current_lat, current_lon, "live_user_pos")
 
     col_adjust, col_save = st.columns(2)
     with col_adjust:

@@ -136,7 +136,7 @@
   </head>
   <body>
     <div class="map-shell">
-      <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" hidden></div>
+      <div id="map-config" data-config-b64="__MAP_CONFIG_B64__" data-view-seq="__VIEW_SEQ__" hidden></div>
       <div id="map"></div>
       <button id="follow-toggle" class="follow-toggle" type="button" title="Toggle whether the map rotates with your heading">
         Map: free rotate
@@ -257,6 +257,19 @@
 
       // Freshest heading sample for map-follow lerp (not gated by cone deadband).
       let latestFollowHeading = null;
+      // The nav panel owns the compass; this map only consumes its broadcasts.
+      // Running a second local compass alongside it made the arrow twitch
+      // between two drifting filters, so local sensors are fallback-only.
+      let lastExternalHeadingAt = 0;
+      let compassFallbackTimer = null;
+      const EXTERNAL_HEADING_MAX_AGE_MS = 1000;
+
+      function externalHeadingIsLive() {
+        return (
+          lastExternalHeadingAt > 0 &&
+          Date.now() - lastExternalHeadingAt < EXTERNAL_HEADING_MAX_AGE_MS
+        );
+      }
 
       function applyExternalHeading(heading) {
         const next = Number(heading);
@@ -264,6 +277,7 @@
           return;
         }
         orientationEventSeen = true;
+        lastExternalHeadingAt = Date.now();
         if (sensorIssue === "no-compass") {
           sensorIssue = null;
         }
@@ -292,15 +306,42 @@
         return { distance, bearing: (bearing + 360) % 360 };
       }
 
-      function getFollowTargetHeading() {
-        if (Number.isFinite(latestFollowHeading)) {
-          return ((latestFollowHeading % 360) + 360) % 360;
-        }
-        const heading = Number(MAP_CONFIG.user_heading);
+      // Phone compasses (iOS webkitCompassHeading, Android geomagnetic
+      // rotation vector) report MAGNETIC-north headings; GPS bearings between
+      // RTK coordinates are TRUE-north. true = magnetic + declination
+      // (~+13°E in the Bay Area, 2026). Without this the cone sits ~13° left
+      // of true facing and the arrow leads right of the target.
+      //
+      // IMPORTANT: stored headings (MAP_CONFIG.user_heading,
+      // latestFollowHeading) stay RAW MAGNETIC everywhere — the nav panel
+      // publishes raw values too. The correction is applied exactly once, at
+      // these read functions, so the arrow, cone, and map-follow rotation all
+      // see one consistent corrected heading and can never mix corrected and
+      // uncorrected readings (which previously made the arrow twitch).
+      // Tune if relocating: still left => increase, drifted right => decrease.
+      const MAGNETIC_DECLINATION_EAST_DEG = 13;
+
+      function magneticToTrueHeading(magnetic) {
+        const heading = Number(magnetic);
         if (!Number.isFinite(heading)) {
           return null;
         }
-        return ((heading % 360) + 360) % 360;
+        return (
+          ((heading + MAGNETIC_DECLINATION_EAST_DEG) % 360 + 360) % 360
+        );
+      }
+
+      // Corrected heading for the nav arrow (relative bearing) and map cone.
+      function getNavUserHeading() {
+        return magneticToTrueHeading(MAP_CONFIG.user_heading);
+      }
+
+      // Corrected heading for map-follow rotation (freshest sample wins).
+      function getFollowTargetHeading() {
+        if (Number.isFinite(latestFollowHeading)) {
+          return magneticToTrueHeading(latestFollowHeading);
+        }
+        return getNavUserHeading();
       }
 
       function centerMapOnUser(animate) {
@@ -486,7 +527,9 @@
           readout.className = "nav-readout";
         }
 
-        const heading = Number(MAP_CONFIG.user_heading);
+        // Corrected (true-north) heading — feeds the published relative_bearing
+        // that drives the nav panel's arrow.
+        const heading = getNavUserHeading();
         if (!Number.isFinite(heading)) {
           const headingHint = {
             insecure: "open the app over HTTPS for compass directions",
@@ -712,7 +755,8 @@
       let coneScreenRotCum = null;
 
       function updateFacingCone() {
-        const heading = Number(MAP_CONFIG.user_heading);
+        // Same corrected heading the arrow uses — cone and arrow must agree.
+        const heading = getNavUserHeading();
         const lat = Number(MAP_CONFIG.user_lat);
         const lon = Number(MAP_CONFIG.user_lon);
         if (
@@ -817,6 +861,11 @@
       }
 
       function applyConeHeading() {
+        // The nav panel's broadcast is authoritative while it is publishing;
+        // writing our own EMA on top of it is what made the arrow twitch.
+        if (externalHeadingIsLive()) {
+          return;
+        }
         const smoothed = getSmoothedHeading();
         if (smoothed == null) {
           return;
@@ -1243,10 +1292,27 @@
           headingChannel.onmessage = (event) => {
             const data = event.data || {};
             if (data.action === "enableCompass") {
-              enableClientSensors();
+              // The nav panel is about to publish headings. Only start local
+              // sensors if nothing arrives (e.g. BroadcastChannel blocked) —
+              // running both compasses at once made the arrow twitch.
+              if (compassFallbackTimer != null) {
+                clearTimeout(compassFallbackTimer);
+              }
+              compassFallbackTimer = setTimeout(() => {
+                compassFallbackTimer = null;
+                if (!externalHeadingIsLive()) {
+                  enableClientSensors();
+                }
+              }, 2000);
               return;
             }
             if (data.heading != null) {
+              if (compassFallbackTimer != null) {
+                clearTimeout(compassFallbackTimer);
+                compassFallbackTimer = null;
+              }
+              // Panel is driving heading; retire the local compass loop.
+              stopHeadingRefreshTimer();
               applyExternalHeading(data.heading);
             }
           };

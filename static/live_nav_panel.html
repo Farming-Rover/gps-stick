@@ -422,7 +422,7 @@
     </style>
   </head>
   <body>
-    <div class="panel" id="nav-panel">
+    <div class="panel" id="nav-panel" data-view-seq="__VIEW_SEQ__">
       <div class="compass-row">
         <button id="enable-compass" class="compass-btn" type="button">
           Enable compass
@@ -585,6 +585,10 @@
       }
 
       function publishHeading(heading) {
+        // Publish RAW MAGNETIC heading. The magnetic→true declination
+        // correction lives in live_field_map.html (getNavUserHeading) and is
+        // applied exactly once at read time; correcting here as well would
+        // double-apply it and skew both the arrow and the cone.
         try {
           if (typeof BroadcastChannel !== "undefined") {
             const channel = new BroadcastChannel(HEADING_MESSAGE_TYPE);

@@ -105,9 +105,12 @@ def post_broadcast_message(channel_type: str, payload: dict) -> None:
         {"type": channel_type, "_nonce": time.time_ns(), **payload}
     )
     channel_name = json.dumps(channel_type)
-    render_html_embed(
+    # Transport-only iframe: must not reserve layout. st.iframe rejects height 0
+    # and a 1 px frame paints as a flashing white separator on every fragment
+    # tick, so use components.html at height 0 instead.
+    components.html(
         f"""
-        <div data-msg-b64="{message_b64}" id="gps-stick-msg" hidden></div>
+        <div data-gps-stick-msg="1" data-msg-b64="{message_b64}" id="gps-stick-msg" hidden></div>
         <script>
         (function() {{
           const msg = JSON.parse(
@@ -132,7 +135,8 @@ def post_broadcast_message(channel_type: str, payload: dict) -> None:
         }})();
         </script>
         """,
-        height=1,
+        height=0,
+        scrolling=False,
     )
 
 

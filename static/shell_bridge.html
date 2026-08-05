@@ -23,7 +23,7 @@
         var FIT_VIEWPORT =
           "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
         // Bump when one-time shell listeners change.
-        var SHELL_VERSION = 7;
+        var SHELL_VERSION = 8;
         var alreadyInstalled = topWin.__gpsStickShellInstalled === SHELL_VERSION;
         topWin.__gpsStickShellInstalled = SHELL_VERSION;
 
@@ -119,6 +119,52 @@
         ensureViewportMeta().setAttribute("content", FIT_VIEWPORT);
 
         if (!alreadyInstalled) {
+          // After the phone locks / Safari suspends the tab, iframes are often
+          // discarded while Streamlit session flags still say they are mounted.
+          // Reload once after a long background so live nav/map are recreated.
+          (function installWakeRemount() {
+            var hiddenAt = null;
+            var WAKE_REMOUNT_MS = 8000;
+            function markHidden() {
+              hiddenAt = Date.now();
+            }
+            function maybeRemountAfterWake() {
+              if (hiddenAt == null) {
+                return;
+              }
+              var awayMs = Date.now() - hiddenAt;
+              hiddenAt = null;
+              if (awayMs < WAKE_REMOUNT_MS) {
+                return;
+              }
+              try {
+                var url = new URL(topWin.location.href);
+                // Avoid reload loops if a previous wake marker is still present.
+                if (url.searchParams.has("gps_stick_wake")) {
+                  return;
+                }
+                url.searchParams.set("gps_stick_wake", String(Date.now()));
+                topWin.location.replace(url.toString());
+              } catch (error) {
+                // Navigation may be blocked.
+              }
+            }
+            topDoc.addEventListener("visibilitychange", function () {
+              if (topDoc.visibilityState === "hidden") {
+                markHidden();
+              } else if (topDoc.visibilityState === "visible") {
+                maybeRemountAfterWake();
+              }
+            });
+            topWin.addEventListener("pageshow", function (event) {
+              if (event && event.persisted) {
+                maybeRemountAfterWake();
+              }
+            });
+            topWin.addEventListener("freeze", markHidden);
+            topWin.addEventListener("resume", maybeRemountAfterWake);
+          })();
+
           function sidebarEl() {
             return topDoc.querySelector('[data-testid="stSidebar"]');
           }
